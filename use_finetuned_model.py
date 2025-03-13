@@ -43,19 +43,24 @@ def run_inference(prompt, model_dir="./hf_model_export", base_model_dir="./Wan2.
     sys.path.insert(0, os.path.abspath("Wan2_1"))
     
     try:
-        # Créer un dossier temporaire pour combiner le modèle de base et les poids fine-tunés
-        temp_model_dir = "./temp_model"
+        # Utiliser un chemin avec plus d'espace disponible
+        temp_model_dir = "/workspace/temp_model"
         if os.path.exists(temp_model_dir):
             shutil.rmtree(temp_model_dir)
         os.makedirs(temp_model_dir, exist_ok=True)
         
-        # Copier les fichiers du modèle de base
-        logger.info(f"Copie des fichiers du modèle de base depuis {base_model_dir}...")
+        # Créer des liens symboliques pour les fichiers volumineux du modèle de base
+        logger.info(f"Création de liens symboliques pour les fichiers du modèle de base depuis {base_model_dir}...")
         for item in os.listdir(base_model_dir):
             s = os.path.join(base_model_dir, item)
             d = os.path.join(temp_model_dir, item)
-            if os.path.isdir(s):
-                shutil.copytree(s, d, dirs_exist_ok=True)
+            
+            # Utiliser des liens symboliques pour les fichiers volumineux
+            if item.endswith('.safetensors') or item.endswith('.pth'):
+                logger.info(f"Création d'un lien symbolique pour {item}")
+                os.symlink(os.path.abspath(s), d)
+            elif os.path.isdir(s):
+                shutil.copytree(s, d, symlinks=True, dirs_exist_ok=True)
             else:
                 shutil.copy2(s, d)
         
@@ -68,6 +73,11 @@ def run_inference(prompt, model_dir="./hf_model_export", base_model_dir="./Wan2.
                 
                 s = os.path.join(model_dir, item)
                 d = os.path.join(temp_model_dir, item)
+                
+                # Ne pas écraser les liens symboliques existants pour les fichiers volumineux
+                if os.path.exists(d) and (item.endswith('.safetensors') or item.endswith('.pth')):
+                    logger.info(f"Fichier {item} déjà présent, conservation du lien symbolique")
+                    continue
                 
                 if os.path.isdir(s):
                     if os.path.exists(d):
@@ -128,6 +138,15 @@ def run_inference(prompt, model_dir="./hf_model_export", base_model_dir="./Wan2.
     finally:
         # Nettoyer le dossier temporaire
         if os.path.exists(temp_model_dir):
+            # Supprimer uniquement les fichiers non symboliques
+            for item in os.listdir(temp_model_dir):
+                path = os.path.join(temp_model_dir, item)
+                if not os.path.islink(path):
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+            # Supprimer le dossier lui-même
             shutil.rmtree(temp_model_dir)
 
 def main():
