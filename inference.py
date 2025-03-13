@@ -26,7 +26,15 @@ def install_dependencies():
         "timm",
         "omegaconf",
         "imageio",
-        "imageio-ffmpeg"
+        "imageio-ffmpeg",
+        "ftfy",
+        "regex",
+        "tqdm",
+        "matplotlib",
+        "scikit-image",
+        "lpips",
+        "kornia",
+        "av"
     ]
     
     for dep in dependencies:
