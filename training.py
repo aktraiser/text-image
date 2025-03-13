@@ -501,6 +501,108 @@ def upload_to_hf(export_dir, repo_id):
             logger.error(f"Failed to upload with CLI: {str(cli_error)}")
             return False
 
+def save_full_model(model, output_dir):
+    """Sauvegarde le modèle complet (base + LoRA) dans le dossier spécifié."""
+    import torch
+    import shutil
+    from pathlib import Path
+    
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Sauvegarde du modèle complet dans {output_dir}...")
+    
+    try:
+        # Fusionner les poids LoRA avec le modèle de base
+        if hasattr(model, "merge_and_unload"):
+            logger.info("Fusion des poids LoRA avec le modèle de base...")
+            merged_model = model.merge_and_unload()
+            
+            # Sauvegarder le modèle fusionné
+            merged_model.save_pretrained(output_dir)
+            logger.info("Modèle fusionné sauvegardé avec succès.")
+        else:
+            # Si le modèle n'a pas la méthode merge_and_unload, copier le modèle de base
+            # et les fichiers LoRA séparément
+            logger.info("Le modèle ne supporte pas la fusion directe. Copie des fichiers...")
+            
+            # Copier le modèle de base
+            base_model_dir = "./Wan2.1-T2V-14B"
+            if os.path.exists(base_model_dir):
+                for item in os.listdir(base_model_dir):
+                    s = os.path.join(base_model_dir, item)
+                    d = os.path.join(output_dir, item)
+                    
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, d)
+                
+                logger.info("Modèle de base copié avec succès.")
+            else:
+                logger.error(f"Dossier du modèle de base {base_model_dir} introuvable.")
+            
+            # Copier les fichiers LoRA
+            lora_dir = "./outputs/checkpoint-final"
+            if os.path.exists(lora_dir):
+                lora_output_dir = os.path.join(output_dir, "lora")
+                os.makedirs(lora_output_dir, exist_ok=True)
+                
+                for item in os.listdir(lora_dir):
+                    s = os.path.join(lora_dir, item)
+                    d = os.path.join(lora_output_dir, item)
+                    
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, d)
+                
+                logger.info("Fichiers LoRA copiés avec succès.")
+            else:
+                logger.warning(f"Dossier LoRA {lora_dir} introuvable.")
+        
+        # Créer un fichier README.md avec des instructions d'utilisation
+        readme_path = os.path.join(output_dir, "README.md")
+        with open(readme_path, "w") as f:
+            f.write("# Modèle Wan2.1-T2V-14B Fine-Tuné\n\n")
+            f.write("Ce dossier contient le modèle Wan2.1-T2V-14B avec les poids fine-tunés.\n\n")
+            f.write("## Utilisation\n\n")
+            f.write("```python\n")
+            f.write("from diffusers import DiffusionPipeline\n")
+            f.write("import torch\n\n")
+            f.write("# Charger le modèle\n")
+            f.write("model = DiffusionPipeline.from_pretrained(\n")
+            f.write("    '/workspace/full_model',\n")
+            f.write("    torch_dtype=torch.float16\n")
+            f.write(")\n")
+            f.write("model = model.to('cuda')\n\n")
+            f.write("# Générer une image\n")
+            f.write("prompt = 'A close-up portrait of a woman with medium-length auburn hair blowing in the wind'\n")
+            f.write("image = model(prompt).images[0]\n")
+            f.write("image.save('output.png')\n")
+            f.write("```\n")
+        
+        logger.info("Fichier README.md créé avec succès.")
+        
+        # Créer un fichier de configuration pour l'inférence
+        config_path = os.path.join(output_dir, "inference_config.json")
+        import json
+        with open(config_path, "w") as f:
+            json.dump({
+                "model_type": "Wan2.1-T2V-14B",
+                "fine_tuned": True,
+                "inference_steps": 30,
+                "guidance_scale": 7.5,
+                "resolution": "832*480"
+            }, f, indent=2)
+        
+        logger.info("Fichier de configuration créé avec succès.")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Erreur lors de la sauvegarde du modèle complet: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
 def main():
     """Orchestre l'entraînement, la sauvegarde et le téléversement."""
     # Import required modules
@@ -519,31 +621,52 @@ def main():
     logger.info("Lancement de l'entraînement...")
     trainer.train()
     
-    # Exporter le modèle localement
+    # Exporter le modèle localement (LoRA seulement)
     export_dir = "hf_model_export"
     export_model(model, tokenizer, export_dir)
+    
+    # Sauvegarder le modèle complet dans /workspace
+    full_model_dir = "/workspace/full_model"
+    logger.info(f"Sauvegarde du modèle complet dans {full_model_dir}...")
+    try:
+        save_full_model(model, full_model_dir)
+        logger.info(f"Modèle complet sauvegardé avec succès dans {full_model_dir}")
+    except Exception as e:
+        logger.error(f"Erreur lors de la sauvegarde du modèle complet: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
     
     # Ask user if they want to upload to Hugging Face
     upload_choice = input("Do you want to upload the model to Hugging Face? (yes/no): ")
     
     if upload_choice.lower() in ["yes", "y", "oui", "o"]:
+        # Ask which model to upload: LoRA only or full model
+        model_choice = input("Which model do you want to upload? (1: LoRA only, 2: Full model): ")
+        
         # Get the repository name from the user
         username = input("Enter your Hugging Face username: ")
         model_name = input("Enter a name for your model repository: ")
         repo_id = f"{username}/{model_name}"
         
-        # Upload the model
-        logger.info(f"Uploading model to {repo_id}...")
-        upload_success = upload_to_hf(export_dir, repo_id)
+        # Upload the selected model
+        if model_choice == "2":
+            logger.info(f"Uploading full model to {repo_id}...")
+            upload_success = upload_to_hf(full_model_dir, repo_id)
+        else:
+            logger.info(f"Uploading LoRA model to {repo_id}...")
+            upload_success = upload_to_hf(export_dir, repo_id)
         
         if upload_success:
             logger.info(f"Model uploaded successfully to: https://huggingface.co/{repo_id}")
         else:
-            logger.info("You can manually upload the model from the 'hf_model_export' directory using the Hugging Face CLI:")
+            logger.info("You can manually upload the model using the Hugging Face CLI:")
             logger.info(f"  huggingface-cli login")
-            logger.info(f"  huggingface-cli upload {export_dir} {repo_id}")
+            if model_choice == "2":
+                logger.info(f"  huggingface-cli upload {full_model_dir} {repo_id}")
+            else:
+                logger.info(f"  huggingface-cli upload {export_dir} {repo_id}")
     else:
-        logger.info("Skipping upload to Hugging Face. Model saved locally in 'hf_model_export' directory.")
+        logger.info("Skipping upload to Hugging Face. Models saved locally.")
     
     logger.info("Training process completed successfully.")
 
