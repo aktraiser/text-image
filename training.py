@@ -330,12 +330,23 @@ def export_model(model, tokenizer, export_dir):
 def upload_to_hf(export_dir, repo_id):
     """Téléverse le modèle sur Hugging Face."""
     api = HfApi()
+    
+    # Check if the repository exists, create it if it doesn't
+    try:
+        api.repo_info(repo_id=repo_id, repo_type="model")
+        logger.info(f"Repository {repo_id} exists, uploading files...")
+    except Exception:
+        logger.info(f"Repository {repo_id} does not exist, creating it...")
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    
+    # Upload the files
+    logger.info(f"Uploading files to {repo_id}...")
     api.upload_folder(
         folder_path=export_dir,
         repo_id=repo_id,
         repo_type="model"
     )
-    logger.info(f"Modèle téléversé sur : https://huggingface.co/{repo_id}")
+    logger.info(f"Model uploaded to: https://huggingface.co/{repo_id}")
 
 def main():
     """Orchestre l'entraînement, la sauvegarde et le téléversement."""
@@ -356,11 +367,32 @@ def main():
     export_dir = "hf_model_export"
     export_model(model, tokenizer, export_dir)
     
-    # Téléverser sur Hugging Face
-    repo_id = "votre-nom-utilisateur/nom-du-modele"  # À personnaliser
-    upload_to_hf(export_dir, repo_id)
+    # Ask user if they want to upload to Hugging Face
+    upload_choice = input("Do you want to upload the model to Hugging Face? (yes/no): ")
     
-    logger.info("Processus terminé avec succès.")
+    if upload_choice.lower() in ["yes", "y", "oui", "o"]:
+        # Get the repository name from the user
+        username = input("Enter your Hugging Face username: ")
+        model_name = input("Enter a name for your model repository: ")
+        repo_id = f"{username}/{model_name}"
+        
+        # Create the repository if it doesn't exist
+        api = HfApi()
+        try:
+            logger.info(f"Creating repository: {repo_id}")
+            api.create_repo(repo_id=repo_id, exist_ok=True)
+            
+            # Upload the model
+            logger.info(f"Uploading model to {repo_id}...")
+            upload_to_hf(export_dir, repo_id)
+            logger.info(f"Model uploaded successfully to: https://huggingface.co/{repo_id}")
+        except Exception as e:
+            logger.error(f"Failed to upload model: {str(e)}")
+            logger.info("You can manually upload the model from the 'hf_model_export' directory")
+    else:
+        logger.info("Skipping upload to Hugging Face. Model saved locally in 'hf_model_export' directory.")
+    
+    logger.info("Training process completed successfully.")
 
 if __name__ == "__main__":
     main()
