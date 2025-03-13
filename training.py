@@ -200,11 +200,11 @@ def setup_trainer(model, tokenizer, dataset):
         output_dir="./outputs",          # Dossier de sortie
         per_device_train_batch_size=1,   # Taille du batch par appareil
         num_train_epochs=1,              # Nombre d'époques
-        max_steps=10,                  # Nombre total de pas
+        max_steps=10,                    # Nombre total de pas
         learning_rate=0.0001,            # Taux d'apprentissage
         optim="adamw_8bit",              # Optimiseur adapté
-        logging_steps=250,               # Intervalle de logs
-        save_steps=250,                  # Intervalle de sauvegarde
+        logging_steps=5,                 # Intervalle de logs (reduced for shorter training)
+        save_steps=10,                   # Intervalle de sauvegarde (reduced for shorter training)
         gradient_checkpointing=False,    # Pas de checkpointing
         fp16=torch.cuda.is_available(),  # Utiliser FP16 si GPU disponible
         report_to="wandb",               # Suivi avec Weights & Biases
@@ -213,14 +213,39 @@ def setup_trainer(model, tokenizer, dataset):
         save_total_limit=3,              # Limite de sauvegardes
     )
     
-    # Initialiser l'entraîneur
-    trainer = SFTTrainer(
-        model=model.unet if hasattr(model, "unet") else model,  # Entraîner uniquement le UNET
-        tokenizer=tokenizer,
-        train_dataset=dataset,
-        dataset_text_field="text",       # Champ texte du dataset
-        args=training_args,
-    )
+    # Check the version of trl to determine the correct parameters
+    import trl
+    trl_version = getattr(trl, "__version__", "0.0.0")
+    logger.info(f"Using TRL version: {trl_version}")
+    
+    # Prepare trainer parameters based on TRL version
+    trainer_kwargs = {
+        "model": model.unet if hasattr(model, "unet") else model,
+        "tokenizer": tokenizer,
+        "train_dataset": dataset,
+        "args": training_args,
+    }
+    
+    # Add text_column parameter for newer versions, or try dataset_text_field for older versions
+    try:
+        trainer = SFTTrainer(
+            **trainer_kwargs,
+            text_column="text"  # For newer versions of TRL
+        )
+    except TypeError as e:
+        logger.warning(f"Error with text_column parameter: {e}")
+        try:
+            # Try with dataset_text_field for older versions
+            trainer = SFTTrainer(
+                **trainer_kwargs,
+                dataset_text_field="text"
+            )
+        except TypeError as e2:
+            logger.warning(f"Error with dataset_text_field parameter: {e2}")
+            # Last resort: try without any text field parameter
+            trainer = SFTTrainer(
+                **trainer_kwargs
+            )
     
     return trainer
 
