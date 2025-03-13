@@ -301,14 +301,26 @@ def export_model(model, tokenizer, export_dir):
     
     # Sauvegarder le modèle avec sharding
     if hasattr(model, "save_pretrained"):
-        model.save_pretrained(export_dir, max_shard_size="5GB")
+        logger.info("Saving model using save_pretrained method")
+        model.save_pretrained(export_dir, max_shard_size="5GB", safe_serialization=True)
     else:
         # Fallback for custom model structure
         if hasattr(model, "unet") and hasattr(model.unet, "save_pretrained"):
-            model.unet.save_pretrained(os.path.join(export_dir, "unet"), max_shard_size="5GB")
+            logger.info("Saving UNet component")
+            model.unet.save_pretrained(os.path.join(export_dir, "unet"), max_shard_size="5GB", safe_serialization=True)
+        else:
+            logger.warning("Could not find a valid model component to save")
+            
+            # If we're using a dummy model, save it
+            if isinstance(model, torch.nn.Module):
+                logger.info("Saving model as a PyTorch module")
+                torch.save(model.state_dict(), os.path.join(export_dir, "model.safetensors"), _use_new_zipfile_serialization=True)
+            else:
+                logger.error("Model is not a valid PyTorch module, cannot save")
     
     # Save tokenizer if available
     if tokenizer is not None:
+        logger.info("Saving tokenizer")
         tokenizer.save_pretrained(export_dir)
     
     # Ajouter un fichier .gitattributes pour Git LFS
@@ -319,34 +331,64 @@ def export_model(model, tokenizer, export_dir):
     
     # Ajouter un fichier README.md
     with open(os.path.join(export_dir, "README.md"), "w") as f:
-        f.write("# Modèle Fine-Tuné Wan2.1-T2V-14B\n\n")
-        f.write("Ce modèle est une version fine-tunée de Wan2.1-T2V-14B.\n\n")
-        f.write("## Chargement\n```python\n")
+        f.write("# Fine-Tuned Text-to-Image Model\n\n")
+        f.write("This model is a fine-tuned version based on Wan2.1-T2V-14B.\n\n")
+        f.write("## Loading\n```python\n")
         f.write("from diffusers import DiffusionPipeline\n")
-        f.write('model = DiffusionPipeline.from_pretrained("votre-nom/nom-du-modele")\n')
+        f.write('model = DiffusionPipeline.from_pretrained("your-username/text-image")\n')
         f.write("```\n\n")
-        f.write("## Paramètres\n- Steps : 2000\n- Learning rate : 0.0001\n- Optimiseur : adamw_8bit\n")
+        f.write("## Parameters\n- Steps: 10\n- Learning rate: 0.0001\n- Optimizer: adamw_8bit\n")
+    
+    logger.info(f"Model exported to {export_dir}")
+    
+    # List the files in the export directory to verify
+    logger.info("Files in export directory:")
+    for root, dirs, files in os.walk(export_dir):
+        for file in files:
+            logger.info(f"  {os.path.join(root, file)}")
 
 def upload_to_hf(export_dir, repo_id):
     """Téléverse le modèle sur Hugging Face."""
-    api = HfApi()
+    # Check for HF_TOKEN in environment
+    hf_token = os.environ.get("HF_TOKEN")
+    
+    # If not in environment, ask the user
+    if not hf_token:
+        logger.info("HF_TOKEN not found in environment variables")
+        hf_token = input("Please enter your Hugging Face token (from https://huggingface.co/settings/tokens): ")
+        
+        if not hf_token:
+            logger.error("No token provided, cannot upload to Hugging Face")
+            return False
+    
+    # Initialize the API with the token
+    api = HfApi(token=hf_token)
     
     # Check if the repository exists, create it if it doesn't
     try:
         api.repo_info(repo_id=repo_id, repo_type="model")
         logger.info(f"Repository {repo_id} exists, uploading files...")
-    except Exception:
-        logger.info(f"Repository {repo_id} does not exist, creating it...")
-        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    except Exception as e:
+        logger.info(f"Repository {repo_id} does not exist, creating it... ({str(e)})")
+        try:
+            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+        except Exception as create_error:
+            logger.error(f"Failed to create repository: {str(create_error)}")
+            return False
     
     # Upload the files
-    logger.info(f"Uploading files to {repo_id}...")
-    api.upload_folder(
-        folder_path=export_dir,
-        repo_id=repo_id,
-        repo_type="model"
-    )
-    logger.info(f"Model uploaded to: https://huggingface.co/{repo_id}")
+    try:
+        logger.info(f"Uploading files to {repo_id}...")
+        api.upload_folder(
+            folder_path=export_dir,
+            repo_id=repo_id,
+            repo_type="model"
+        )
+        logger.info(f"Model uploaded to: https://huggingface.co/{repo_id}")
+        return True
+    except Exception as upload_error:
+        logger.error(f"Failed to upload files: {str(upload_error)}")
+        return False
 
 def main():
     """Orchestre l'entraînement, la sauvegarde et le téléversement."""
@@ -376,19 +418,16 @@ def main():
         model_name = input("Enter a name for your model repository: ")
         repo_id = f"{username}/{model_name}"
         
-        # Create the repository if it doesn't exist
-        api = HfApi()
-        try:
-            logger.info(f"Creating repository: {repo_id}")
-            api.create_repo(repo_id=repo_id, exist_ok=True)
-            
-            # Upload the model
-            logger.info(f"Uploading model to {repo_id}...")
-            upload_to_hf(export_dir, repo_id)
+        # Upload the model
+        logger.info(f"Uploading model to {repo_id}...")
+        upload_success = upload_to_hf(export_dir, repo_id)
+        
+        if upload_success:
             logger.info(f"Model uploaded successfully to: https://huggingface.co/{repo_id}")
-        except Exception as e:
-            logger.error(f"Failed to upload model: {str(e)}")
-            logger.info("You can manually upload the model from the 'hf_model_export' directory")
+        else:
+            logger.info("You can manually upload the model from the 'hf_model_export' directory using the Hugging Face CLI:")
+            logger.info(f"  huggingface-cli login")
+            logger.info(f"  huggingface-cli upload {export_dir} {repo_id}")
     else:
         logger.info("Skipping upload to Hugging Face. Model saved locally in 'hf_model_export' directory.")
     
