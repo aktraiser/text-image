@@ -1,299 +1,398 @@
 import torch
-from diffusers import DiffusionPipeline
-import os
-import logging
-import datetime
-import argparse
-from PIL import Image
-import sys
-import importlib.util
-import subprocess
-import glob
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
+import os
+import argparse
+import logging
+import time
+from pathlib import Path
+import pandas as pd
 
 # Configuration du logger
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("inference.log")
+    ]
+)
 logger = logging.getLogger(__name__)
 
-def install_dependencies():
-    """Installe les dépendances nécessaires pour le modèle Wan2.1."""
-    import subprocess
-    logger.info("Installation des dépendances pour Wan2.1...")
-    
-    dependencies = [
-        "easydict",
-        "einops",
-        "decord",
-        "opencv-python",
-        "timm",
-        "omegaconf",
-        "imageio",
-        "imageio-ffmpeg",
-        "ftfy",
-        "regex",
-        "tqdm",
-        "matplotlib",
-        "scikit-image",
-        "lpips",
-        "kornia",
-        "av"
-    ]
-    
-    for dep in dependencies:
-        try:
-            logger.info(f"Installation de {dep}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", dep])
-            logger.info(f"{dep} installé avec succès")
-        except Exception as e:
-            logger.warning(f"Erreur lors de l'installation de {dep}: {str(e)}")
+# Désactiver le parallélisme des tokenizers pour éviter les warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def load_module_from_file(file_path, module_name):
-    """Load a Python module from a file path."""
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None:
-        return None
+def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=None):
+    """
+    Initialise le modèle et le tokenizer à partir du chemin spécifié.
     
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-def clone_wan_repository():
-    """Clone the Wan2.1 repository to access the model code."""
-    logger.info("Cloning the Wan2.1 repository...")
-    
-    if not os.path.exists("Wan2_1"):  # Changed directory name to avoid the dot
-        import subprocess
-        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git", "Wan2_1"], check=True)
-        logger.info("Repository cloned successfully.")
-    else:
-        logger.info("Repository already exists, skipping clone.")
-    
-    # Add the repository to Python path to import modules
-    sys.path.append(os.path.abspath("Wan2_1"))
-
-def is_full_model(model_dir):
-    """Détecte si le dossier contient un modèle complet (fusionné) ou un modèle de base."""
-    # Vérifier la présence du fichier de configuration d'inférence
-    if os.path.exists(os.path.join(model_dir, "inference_config.json")):
-        return True
-    
-    # Vérifier la présence du dossier lora
-    if os.path.exists(os.path.join(model_dir, "lora")):
-        return True
-    
-    return False
-
-def load_model(model_dir="/workspace/full_model"):
-    """Charge le modèle Wan2.1-T2V-14B depuis le dossier spécifié."""
-    logger.info(f"Chargement du modèle depuis {model_dir}...")
-    
-    # Installer les dépendances nécessaires
-    install_dependencies()
+    Args:
+        model_path: Chemin vers le modèle sauvegardé
+        max_seq_length: Longueur maximale de séquence
+        load_in_4bit: Utiliser la quantification 4-bit
+        device: Périphérique à utiliser (None pour auto-détection)
+        
+    Returns:
+        tuple: (model, tokenizer)
+    """
+    start_time = time.time()
+    logger.info(f"Chargement du modèle depuis {model_path}")
     
     # Vérifier si le modèle existe
-    if not os.path.exists(model_dir):
-        logger.error(f"Modèle non trouvé dans {model_dir}")
-        
-        # Vérifier si le modèle existe dans le dossier par défaut
-        default_model_dir = "./Wan2.1-T2V-14B"
-        if os.path.exists(default_model_dir):
-            logger.info(f"Utilisation du modèle de base dans {default_model_dir}")
-            model_dir = default_model_dir
-        else:
-            logger.error("Modèle non trouvé localement")
-            return None
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Le chemin du modèle {model_path} n'existe pas")
     
-    # Vérifier si c'est un modèle complet ou un modèle de base
-    is_merged_model = is_full_model(model_dir)
-    if is_merged_model:
-        logger.info("Modèle complet détecté")
+    # Déterminer le type de données à utiliser
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Déterminer le dtype en fonction du matériel
+    if device == "cuda":
+        if torch.cuda.get_device_capability()[0] >= 8:  # Ampere+ (RTX 30xx, A100, etc.)
+            dtype = torch.bfloat16
+            logger.info("Utilisation de bfloat16 sur GPU Ampere+")
+        else:  # Architectures plus anciennes
+            dtype = torch.float16
+            logger.info("Utilisation de float16 sur GPU pré-Ampere")
     else:
-        logger.info("Modèle de base détecté")
+        dtype = torch.float32
+        logger.info("Utilisation de float32 sur CPU")
+        load_in_4bit = False  # Désactiver la quantification 4-bit sur CPU
     
-    # Essayer de charger le modèle avec diffusers
-    try:
-        model = DiffusionPipeline.from_pretrained(
-            model_dir,
-            torch_dtype=torch.float16,
-            variant="fp16"
-        )
-        model = model.to("cuda")
-        logger.info("Modèle chargé avec succès via DiffusionPipeline")
-        return model
-    except Exception as e:
-        logger.warning(f"Erreur lors du chargement du modèle avec DiffusionPipeline: {str(e)}")
-    
-    # Si le chargement avec diffusers échoue, essayer d'utiliser le code de Wan2.1
-    try:
-        clone_wan_repository()
-        
-        # Essayer d'importer le module de génération de Wan2.1
+    # Charger le fichier de configuration d'inférence s'il existe
+    config_path = os.path.join(model_path, "inference_config.json")
+    inference_config = {}
+    if os.path.exists(config_path):
         try:
-            # Importer directement depuis le dépôt cloné
-            sys.path.insert(0, os.path.abspath("Wan2_1"))
-            
-            try:
-                import easydict
-                logger.info("Module easydict importé avec succès")
-            except ImportError:
-                logger.error("Module easydict non trouvé malgré l'installation")
-            
-            # Utiliser le script generate.py directement via subprocess
-            logger.info("Utilisation du script generate.py via subprocess")
-            
-            # Créer une classe wrapper pour le modèle Wan
-            class WanModelWrapper:
-                def __init__(self, model_path):
-                    self.model_path = model_path
-                
-                def __call__(self, prompt, num_inference_steps=30, guidance_scale=7.5, size="832*480"):
-                    output_dir = "./generated_outputs"
-                    os.makedirs(output_dir, exist_ok=True)
-                    
-                    cmd = [
-                        sys.executable,
-                        "Wan2_1/generate.py",
-                        "--task", "t2v-14B",
-                        "--size", size,
-                        "--ckpt_dir", self.model_path,
-                        "--prompt", prompt,
-                        "--output_dir", output_dir,
-                        "--num_inference_steps", str(num_inference_steps),
-                        "--guidance_scale", str(guidance_scale)
-                    ]
-                    
-                    # Si c'est un modèle complet avec dossier lora, ajouter le chemin du lora
-                    lora_dir = os.path.join(self.model_path, "lora")
-                    if os.path.exists(lora_dir):
-                        lora_files = glob.glob(os.path.join(lora_dir, "*.safetensors"))
-                        if lora_files:
-                            lora_file = lora_files[0]
-                            cmd.extend(["--lora_path", lora_file, "--lora_scale", "0.8"])
-                    
-                    logger.info(f"Exécution de la commande: {' '.join(cmd)}")
-                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                    
-                    # Chercher le fichier généré le plus récent
-                    files = glob.glob(f"{output_dir}/*.mp4") + glob.glob(f"{output_dir}/*.gif") + glob.glob(f"{output_dir}/*.png")
-                    if files:
-                        latest_file = max(files, key=os.path.getctime)
-                        logger.info(f"Fichier généré: {latest_file}")
-                        
-                        # Créer un objet de type "images" pour être compatible avec l'API de diffusers
-                        if latest_file.endswith(('.png', '.jpg', '.jpeg')):
-                            image = Image.open(latest_file)
-                            class ImageContainer:
-                                def __init__(self, images):
-                                    self.images = images
-                            return ImageContainer([image])
-                        else:
-                            logger.info(f"Fichier vidéo généré: {latest_file}")
-                            class VideoContainer:
-                                def __init__(self, video_path):
-                                    self.video_path = video_path
-                                    self.images = [Image.open(latest_file.replace('.mp4', '.png')) if os.path.exists(latest_file.replace('.mp4', '.png')) else None]
-                            return VideoContainer(latest_file)
-                    else:
-                        logger.error("Aucun fichier généré")
-                        return None
-            
-            model = WanModelWrapper(model_dir)
-            logger.info("Modèle Wan2.1 chargé avec succès via le wrapper")
-            return model
-                
-        except ImportError as e:
-            logger.error(f"Erreur lors de l'importation du module generate: {str(e)}")
-                
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
+            with open(config_path, 'r') as f:
+                inference_config = json.load(f)
+                logger.info(f"Configuration d'inférence chargée: {inference_config}")
+        except Exception as e:
+            logger.warning(f"Erreur lors du chargement de la configuration d'inférence: {e}")
     
-    logger.error("Impossible de charger le modèle par aucune méthode")
-    return None
-
-def run_inference(model, prompt, output_dir="./generated_outputs", num_inference_steps=30, guidance_scale=7.5, size="832*480"):
-    """Exécute l'inférence avec le modèle."""
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Exécution de l'inférence avec le prompt: {prompt}")
-    
+    # Charger le tokenizer
     try:
-        # Générer l'image ou la vidéo
-        if hasattr(model, "__call__"):
-            # Pour le wrapper Wan
-            output = model(
-                prompt=prompt,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                size=size
-            )
-        else:
-            # Pour le pipeline de diffusion standard
-            output = model(
-                prompt=prompt,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale
-            ).images[0]
-        
-        # Sauvegarder l'image générée
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_prompt = "".join(c if c.isalnum() else "_" for c in prompt[:20])
-        output_path = os.path.join(output_dir, f"{safe_prompt}_{timestamp}.png")
-        
-        if hasattr(output, "images") and output.images and output.images[0]:
-            output.images[0].save(output_path)
-            logger.info(f"Image générée sauvegardée à: {output_path}")
-            return output_path
-        elif isinstance(output, list) and hasattr(output[0], "save"):
-            output[0].save(output_path)
-            logger.info(f"Image générée sauvegardée à: {output_path}")
-            return output_path
-        elif hasattr(output, "save"):
-            output.save(output_path)
-            logger.info(f"Image générée sauvegardée à: {output_path}")
-            return output_path
-        elif hasattr(output, "video_path"):
-            logger.info(f"Vidéo générée sauvegardée à: {output.video_path}")
-            return output.video_path
-        else:
-            logger.warning(f"Format de sortie non reconnu: {type(output)}")
-            return None
-    
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        logger.info("Tokenizer chargé avec succès")
     except Exception as e:
-        logger.error(f"Erreur lors de l'inférence: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
+        logger.error(f"Erreur lors du chargement du tokenizer: {e}")
+        raise
+    
+    # Charger le modèle
+    try:
+        # Vérifier si nous utilisons Unsloth
+        try:
+            from unsloth import FastLanguageModel
+            logger.info("Utilisation de Unsloth FastLanguageModel pour le chargement")
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_path,
+                max_seq_length=max_seq_length,
+                dtype=dtype,
+                load_in_4bit=load_in_4bit,
+                device_map="auto" if device == "cuda" else device
+            )
+        except ImportError:
+            # Fallback à la méthode standard si Unsloth n'est pas disponible
+            logger.info("Unsloth non disponible, utilisation de AutoModelForCausalLM standard")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                load_in_4bit=load_in_4bit,
+                device_map="auto" if device == "cuda" else device
+            )
+        
+        logger.info(f"Modèle chargé avec succès en {time.time() - start_time:.2f} secondes")
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement du modèle: {e}")
+        raise
+    
+    # Mettre le modèle en mode évaluation
+    model.eval()
+    
+    return model, tokenizer, inference_config
+
+def generate_response(model, tokenizer, prompt, inference_config=None, **kwargs):
+    """
+    Génère une réponse à partir d'un prompt.
+    
+    Args:
+        model: Le modèle à utiliser
+        tokenizer: Le tokenizer à utiliser
+        prompt: Le prompt à utiliser
+        inference_config: Configuration d'inférence (optionnel)
+        **kwargs: Paramètres supplémentaires pour la génération
+        
+    Returns:
+        str: La réponse générée
+    """
+    # Paramètres par défaut
+    generation_config = {
+        "max_new_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": True,
+        "num_beams": 1,
+        "repetition_penalty": 1.1,
+        "no_repeat_ngram_size": 2,
+        "use_cache": True
+    }
+    
+    # Mettre à jour avec la configuration d'inférence si disponible
+    if inference_config:
+        for key in ["max_new_tokens", "temperature", "top_p"]:
+            if key in inference_config:
+                generation_config[key] = inference_config[key]
+    
+    # Mettre à jour avec les paramètres fournis
+    generation_config.update(kwargs)
+    
+    # Encoder le prompt
+    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(model.device)
+    
+    # Générer la réponse
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids=input_ids,
+            **generation_config
+        )
+    
+    # Décoder la réponse (en ignorant le prompt)
+    output_text = tokenizer.decode(output_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
+    
+    return output_text
+
+def interactive_evaluation(model, tokenizer, inference_config=None):
+    """
+    Mode interactif pour évaluer le modèle.
+    
+    Args:
+        model: Le modèle à utiliser
+        tokenizer: Le tokenizer à utiliser
+        inference_config: Configuration d'inférence (optionnel)
+    """
+    prompt_template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Tu es un expert comptable spécialisé dans le conseil aux entreprises. Tu dois fournir une réponse professionnelle et précise basée uniquement sur le contexte fourni.
+
+### Input:
+Type: {content_type}
+Sujet: {title}
+Document: {main_text}
+Question: {questions}
+Source: {source}
+
+### Response:
+"""
+    
+    print("\n" + "="*80)
+    print("Mode interactif d'évaluation du modèle comptable")
+    print("Tapez 'exit' à tout moment pour quitter")
+    print("="*80 + "\n")
+    
+    while True:
+        try:
+            content_type = input("\nType de contenu (ex: Rapport financier): ")
+            if content_type.lower() == 'exit':
+                break
+                
+            title = input("Sujet: ")
+            if title.lower() == 'exit':
+                break
+                
+            main_text = input("Document principal: ")
+            if main_text.lower() == 'exit':
+                break
+                
+            questions = input("Question: ")
+            if questions.lower() == 'exit':
+                break
+                
+            source = input("Source (optionnel): ")
+            if source.lower() == 'exit':
+                break
+            
+            # Construire le prompt
+            prompt = prompt_template.format(
+                content_type=content_type,
+                title=title,
+                main_text=main_text,
+                questions=questions,
+                source=source
+            )
+            
+            print("\nGénération de la réponse...")
+            start_time = time.time()
+            
+            # Générer la réponse
+            output_text = generate_response(model, tokenizer, prompt, inference_config)
+            
+            # Afficher la réponse
+            print("\n" + "-"*80)
+            print("RÉPONSE:")
+            print(output_text)
+            print("-"*80)
+            print(f"Temps de génération: {time.time() - start_time:.2f} secondes")
+            
+        except KeyboardInterrupt:
+            print("\nInterruption détectée. Sortie du mode interactif.")
+            break
+        except Exception as e:
+            logger.error(f"Erreur lors de la génération: {e}")
+            print(f"\nUne erreur s'est produite: {e}")
+
+def batch_evaluation_from_file(model, tokenizer, input_file, output_file=None, inference_config=None):
+    """
+    Évalue le modèle sur un lot de données à partir d'un fichier CSV.
+    
+    Args:
+        model: Le modèle à utiliser
+        tokenizer: Le tokenizer à utiliser
+        input_file: Chemin vers le fichier CSV d'entrée
+        output_file: Chemin vers le fichier CSV de sortie (optionnel)
+        inference_config: Configuration d'inférence (optionnel)
+    """
+    # Vérifier si le fichier existe
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Le fichier d'entrée {input_file} n'existe pas")
+    
+    # Charger les données
+    try:
+        df = pd.read_csv(input_file)
+        logger.info(f"Fichier chargé avec succès: {len(df)} lignes")
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement du fichier: {e}")
+        raise
+    
+    # Vérifier les colonnes requises
+    required_columns = ['content_type', 'title', 'main_text', 'questions']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Colonnes manquantes dans le fichier CSV: {missing_columns}")
+    
+    # Ajouter une colonne 'source' si elle n'existe pas
+    if 'source' not in df.columns:
+        df['source'] = ""
+    
+    # Ajouter une colonne pour les réponses
+    df['model_response'] = ""
+    df['generation_time'] = 0.0
+    
+    # Template de prompt
+    prompt_template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Tu es un expert comptable spécialisé dans le conseil aux entreprises. Tu dois fournir une réponse professionnelle et précise basée uniquement sur le contexte fourni.
+
+### Input:
+Type: {content_type}
+Sujet: {title}
+Document: {main_text}
+Question: {questions}
+Source: {source}
+
+### Response:
+"""
+    
+    # Générer les réponses
+    total_start_time = time.time()
+    for i, row in df.iterrows():
+        try:
+            # Construire le prompt
+            prompt = prompt_template.format(
+                content_type=row['content_type'],
+                title=row['title'],
+                main_text=row['main_text'],
+                questions=row['questions'],
+                source=row['source']
+            )
+            
+            # Générer la réponse
+            start_time = time.time()
+            output_text = generate_response(model, tokenizer, prompt, inference_config)
+            generation_time = time.time() - start_time
+            
+            # Enregistrer la réponse
+            df.at[i, 'model_response'] = output_text
+            df.at[i, 'generation_time'] = generation_time
+            
+            # Afficher la progression
+            logger.info(f"Traité {i+1}/{len(df)} - Temps: {generation_time:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Erreur lors du traitement de la ligne {i}: {e}")
+            df.at[i, 'model_response'] = f"ERREUR: {str(e)}"
+    
+    # Calculer le temps total
+    total_time = time.time() - total_start_time
+    logger.info(f"Traitement terminé en {total_time:.2f} secondes")
+    logger.info(f"Temps moyen par exemple: {total_time/len(df):.2f} secondes")
+    
+    # Sauvegarder les résultats
+    if output_file is None:
+        # Créer un nom de fichier par défaut
+        input_path = Path(input_file)
+        output_file = str(input_path.parent / f"{input_path.stem}_results{input_path.suffix}")
+    
+    df.to_csv(output_file, index=False)
+    logger.info(f"Résultats sauvegardés dans {output_file}")
+    
+    return df
 
 def main():
-    parser = argparse.ArgumentParser(description="Inférence avec le modèle Wan2.1-T2V-14B")
-    parser.add_argument("--prompt", type=str, required=True, help="Prompt pour la génération")
-    parser.add_argument("--model_dir", type=str, default="/workspace/full_model", help="Chemin vers le modèle")
-    parser.add_argument("--output_dir", type=str, default="./generated_outputs", help="Dossier de sortie")
-    parser.add_argument("--steps", type=int, default=30, help="Nombre d'étapes d'inférence")
-    parser.add_argument("--guidance", type=float, default=7.5, help="Échelle de guidance")
-    parser.add_argument("--size", type=str, default="832*480", help="Taille de la vidéo (832*480 ou 1280*720)")
+    """Fonction principale"""
+    parser = argparse.ArgumentParser(description="Inférence avec un modèle comptable fine-tuné")
+    parser.add_argument("--model_path", type=str, default="hf_model_export", 
+                        help="Chemin vers le modèle sauvegardé")
+    parser.add_argument("--mode", type=str, choices=["interactive", "batch"], default="interactive",
+                        help="Mode d'inférence: interactif ou par lot")
+    parser.add_argument("--input_file", type=str, 
+                        help="Fichier CSV d'entrée pour le mode batch")
+    parser.add_argument("--output_file", type=str, 
+                        help="Fichier CSV de sortie pour le mode batch")
+    parser.add_argument("--max_seq_length", type=int, default=2048,
+                        help="Longueur maximale de séquence")
+    parser.add_argument("--load_in_4bit", action="store_true", default=True,
+                        help="Utiliser la quantification 4-bit")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Forcer l'utilisation du CPU")
     
     args = parser.parse_args()
     
-    # Charger le modèle
-    model = load_model(args.model_dir)
+    # Déterminer le périphérique
+    device = "cpu" if args.cpu else None
     
-    if model:
-        # Exécuter l'inférence
-        output_path = run_inference(
-            model, 
-            args.prompt, 
-            args.output_dir, 
-            args.steps, 
-            args.guidance,
-            args.size
+    try:
+        # Initialiser le modèle
+        model, tokenizer, inference_config = initialize_model(
+            args.model_path, 
+            args.max_seq_length,
+            args.load_in_4bit,
+            device
         )
         
-        if output_path:
-            logger.info(f"Inférence terminée avec succès. Fichier sauvegardé à: {output_path}")
-        else:
-            logger.error("Échec de l'inférence")
-    else:
-        logger.error("Impossible de charger le modèle")
+        # Exécuter le mode approprié
+        if args.mode == "interactive":
+            interactive_evaluation(model, tokenizer, inference_config)
+        else:  # batch
+            if not args.input_file:
+                parser.error("--input_file est requis pour le mode batch")
+            
+            batch_evaluation_from_file(
+                model, 
+                tokenizer, 
+                args.input_file, 
+                args.output_file,
+                inference_config
+            )
+        
+    except Exception as e:
+        logger.error(f"Erreur: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 1
+    
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit(main()) 
