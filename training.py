@@ -299,22 +299,59 @@ def export_model(model, tokenizer, export_dir):
     os.makedirs(export_dir, exist_ok=True)
     logger.info(f"Exportation du modèle vers : {export_dir}")
     
+    # Import safetensors explicitly
+    try:
+        import safetensors
+        logger.info(f"SafeTensors version: {safetensors.__version__}")
+    except ImportError:
+        logger.warning("SafeTensors not found, installing it now...")
+        subprocess.run(["pip", "install", "safetensors"], check=True)
+        import safetensors
+        logger.info(f"SafeTensors installed, version: {safetensors.__version__}")
+    
     # Sauvegarder le modèle avec sharding
     if hasattr(model, "save_pretrained"):
         logger.info("Saving model using save_pretrained method")
-        model.save_pretrained(export_dir, max_shard_size="5GB", safe_serialization=True)
+        try:
+            model.save_pretrained(export_dir, max_shard_size="5GB", safe_serialization=True)
+            logger.info("Model saved with safe_serialization=True")
+        except Exception as e:
+            logger.error(f"Error saving with safe_serialization: {str(e)}")
+            logger.info("Trying alternative saving method...")
+            model.save_pretrained(export_dir, max_shard_size="5GB")
+            logger.info("Model saved with default serialization")
     else:
         # Fallback for custom model structure
         if hasattr(model, "unet") and hasattr(model.unet, "save_pretrained"):
             logger.info("Saving UNet component")
-            model.unet.save_pretrained(os.path.join(export_dir, "unet"), max_shard_size="5GB", safe_serialization=True)
+            try:
+                model.unet.save_pretrained(
+                    os.path.join(export_dir, "unet"), 
+                    max_shard_size="5GB", 
+                    safe_serialization=True
+                )
+                logger.info("UNet saved with safe_serialization=True")
+            except Exception as e:
+                logger.error(f"Error saving UNet with safe_serialization: {str(e)}")
+                model.unet.save_pretrained(os.path.join(export_dir, "unet"), max_shard_size="5GB")
+                logger.info("UNet saved with default serialization")
         else:
             logger.warning("Could not find a valid model component to save")
             
             # If we're using a dummy model, save it
             if isinstance(model, torch.nn.Module):
                 logger.info("Saving model as a PyTorch module")
-                torch.save(model.state_dict(), os.path.join(export_dir, "model.safetensors"), _use_new_zipfile_serialization=True)
+                try:
+                    # Try using safetensors directly
+                    from safetensors.torch import save_file
+                    state_dict = model.state_dict()
+                    save_file(state_dict, os.path.join(export_dir, "model.safetensors"))
+                    logger.info("Model saved using safetensors.torch.save_file")
+                except Exception as e:
+                    logger.error(f"Error saving with safetensors: {str(e)}")
+                    # Fallback to PyTorch saving
+                    torch.save(model.state_dict(), os.path.join(export_dir, "model.pt"))
+                    logger.info("Model saved as model.pt using torch.save")
             else:
                 logger.error("Model is not a valid PyTorch module, cannot save")
     
@@ -327,6 +364,7 @@ def export_model(model, tokenizer, export_dir):
     with open(os.path.join(export_dir, ".gitattributes"), "w") as f:
         f.write("*.bin filter=lfs diff=lfs merge=lfs -text\n")
         f.write("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
+        f.write("*.pt filter=lfs diff=lfs merge=lfs -text\n")
         f.write("*.pth filter=lfs diff=lfs merge=lfs -text\n")
     
     # Ajouter un fichier README.md
@@ -345,7 +383,9 @@ def export_model(model, tokenizer, export_dir):
     logger.info("Files in export directory:")
     for root, dirs, files in os.walk(export_dir):
         for file in files:
-            logger.info(f"  {os.path.join(root, file)}")
+            file_path = os.path.join(root, file)
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
+            logger.info(f"  {file_path} ({file_size:.2f} MB)")
 
 def upload_to_hf(export_dir, repo_id):
     """Téléverse le modèle sur Hugging Face."""
@@ -361,6 +401,9 @@ def upload_to_hf(export_dir, repo_id):
             logger.error("No token provided, cannot upload to Hugging Face")
             return False
     
+    # Set the token in the environment for huggingface_hub to use
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+    
     # Initialize the API with the token
     api = HfApi(token=hf_token)
     
@@ -372,6 +415,7 @@ def upload_to_hf(export_dir, repo_id):
         logger.info(f"Repository {repo_id} does not exist, creating it... ({str(e)})")
         try:
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+            logger.info(f"Repository {repo_id} created successfully")
         except Exception as create_error:
             logger.error(f"Failed to create repository: {str(create_error)}")
             return False
@@ -379,6 +423,7 @@ def upload_to_hf(export_dir, repo_id):
     # Upload the files
     try:
         logger.info(f"Uploading files to {repo_id}...")
+        # First try with the API
         api.upload_folder(
             folder_path=export_dir,
             repo_id=repo_id,
@@ -387,8 +432,18 @@ def upload_to_hf(export_dir, repo_id):
         logger.info(f"Model uploaded to: https://huggingface.co/{repo_id}")
         return True
     except Exception as upload_error:
-        logger.error(f"Failed to upload files: {str(upload_error)}")
-        return False
+        logger.error(f"Failed to upload files with API: {str(upload_error)}")
+        
+        # Try with the CLI as a fallback
+        try:
+            logger.info("Trying upload with huggingface-cli...")
+            subprocess.run(["huggingface-cli", "login", "--token", hf_token], check=True)
+            subprocess.run(["huggingface-cli", "upload", export_dir, repo_id], check=True)
+            logger.info(f"Model uploaded to: https://huggingface.co/{repo_id}")
+            return True
+        except Exception as cli_error:
+            logger.error(f"Failed to upload with CLI: {str(cli_error)}")
+            return False
 
 def main():
     """Orchestre l'entraînement, la sauvegarde et le téléversement."""
