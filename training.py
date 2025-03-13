@@ -295,18 +295,33 @@ def setup_trainer(model, tokenizer, dataset):
     
     return trainer
 
-def export_model(model, tokenizer, export_dir):
-    """Sauvegarde le modèle fine-tuné localement."""
+def export_model(model, tokenizer, export_dir, training_args=None):
+    """
+    Enhanced model saving function with better error handling, logging, and metadata.
+    Saves the model to Hugging Face format with proper sharding and documentation.
+    
+    Args:
+        model: The model to save
+        tokenizer: The tokenizer to save
+        export_dir: Directory to save the model to
+        training_args: Optional training arguments for metadata
+    
+    Returns:
+        str: Absolute path to the saved model
+    """
     os.makedirs(export_dir, exist_ok=True)
-    logger.info(f"Exportation du modèle vers : {export_dir}")
+    abs_output_dir = os.path.abspath(export_dir)
+    logger.info(f"Exporting model to: {abs_output_dir}")
     
     # Check available disk space
-    import shutil
     total, used, free = shutil.disk_usage("/")
     free_gb = free / (1024**3)  # Convert to GB
     logger.info(f"Available disk space: {free_gb:.2f} GB")
     
-    # Import safetensors explicitly
+    if free_gb < 10:  # Warning if less than 10GB available
+        logger.warning(f"Low disk space: only {free_gb:.2f} GB available")
+    
+    # Ensure safetensors is installed
     try:
         import safetensors
         logger.info(f"SafeTensors version: {safetensors.__version__}")
@@ -316,69 +331,53 @@ def export_model(model, tokenizer, export_dir):
         import safetensors
         logger.info(f"SafeTensors installed, version: {safetensors.__version__}")
     
-    # Sauvegarder le modèle avec sharding
+    # Save the model with sharding
     if hasattr(model, "save_pretrained"):
         logger.info("Saving model using save_pretrained method")
         try:
-            model.save_pretrained(export_dir, max_shard_size="5GB", safe_serialization=True)
+            model.save_pretrained(
+                export_dir, 
+                max_shard_size="4GB", 
+                safe_serialization=True
+            )
             logger.info("Model saved with safe_serialization=True")
         except Exception as e:
             logger.error(f"Error saving with safe_serialization: {str(e)}")
             logger.info("Trying alternative saving method...")
-            model.save_pretrained(export_dir, max_shard_size="5GB")
+            model.save_pretrained(export_dir, max_shard_size="4GB")
             logger.info("Model saved with default serialization")
     else:
         # Fallback for custom model structure
-        if hasattr(model, "unet") and hasattr(model.unet, "save_pretrained"):
-            logger.info("Saving UNet component")
+        logger.warning("Model does not have save_pretrained method, using fallback approach")
+        
+        # For language models, we might have different components
+        if hasattr(model, "model") and hasattr(model.model, "save_pretrained"):
+            logger.info("Saving model.model component")
             try:
-                model.unet.save_pretrained(
-                    os.path.join(export_dir, "unet"), 
-                    max_shard_size="5GB", 
+                model.model.save_pretrained(
+                    os.path.join(export_dir, "model"), 
+                    max_shard_size="4GB", 
                     safe_serialization=True
                 )
-                logger.info("UNet saved with safe_serialization=True")
+                logger.info("Model component saved with safe_serialization=True")
             except Exception as e:
-                logger.error(f"Error saving UNet with safe_serialization: {str(e)}")
-                model.unet.save_pretrained(os.path.join(export_dir, "unet"), max_shard_size="5GB")
-                logger.info("UNet saved with default serialization")
+                logger.error(f"Error saving model component: {str(e)}")
+                model.model.save_pretrained(os.path.join(export_dir, "model"), max_shard_size="4GB")
+                logger.info("Model component saved with default serialization")
         else:
-            logger.warning("Could not find a valid model component to save")
+            logger.error("Could not find a valid model component to save")
             
-            # Copy only essential model files if disk space is limited
-            try:
-                logger.info("Copying essential model files from Wan2.1-T2V-14B")
-                model_dir = "./Wan2.1-T2V-14B"
-                
-                # Only copy config and metadata files, not the large model weights
-                essential_files = [
-                    "config.json", 
-                    "diffusion_pytorch_model.safetensors.index.json",
-                    # Add any other small essential files here
-                ]
-                
-                # Copy only essential files
-                for file in essential_files:
-                    src_path = os.path.join(model_dir, file)
-                    dst_path = os.path.join(export_dir, file)
-                    if os.path.isfile(src_path):
-                        logger.info(f"Copying {file} to export directory")
-                        shutil.copy2(src_path, dst_path)
-                
-                # Create a placeholder for model weights
-                with open(os.path.join(export_dir, "MODEL_WEIGHTS_NOT_INCLUDED.txt"), "w") as f:
-                    f.write("The model weights were not included in this export due to disk space limitations.\n")
-                    f.write("Please download the original model weights from: https://huggingface.co/Wan-AI/Wan2.1-T2V-14B\n")
-                
-                logger.info("Essential model files copied successfully")
-            except Exception as copy_error:
-                logger.error(f"Error copying essential model files: {str(copy_error)}")
+            # Create a placeholder for model weights
+            with open(os.path.join(export_dir, "MODEL_WEIGHTS_NOT_INCLUDED.txt"), "w") as f:
+                f.write("The model weights could not be saved due to an error.\n")
+                f.write("Please check the logs for more information.\n")
     
     # Save tokenizer if available
     if tokenizer is not None:
         try:
             logger.info("Saving tokenizer")
             tokenizer.save_pretrained(export_dir)
+            logger.info("Tokenizer saved successfully")
         except OSError as e:
             if "No space left on device" in str(e):
                 logger.error("Not enough disk space to save tokenizer")
@@ -386,20 +385,22 @@ def export_model(model, tokenizer, export_dir):
                 with open(os.path.join(export_dir, "TOKENIZER_NOT_INCLUDED.txt"), "w") as f:
                     f.write("The tokenizer was not included in this export due to disk space limitations.\n")
             else:
-                raise
+                logger.error(f"Error saving tokenizer: {str(e)}")
     
-    # Ajouter un fichier .gitattributes pour Git LFS
+    # Add .gitattributes for Git LFS
     try:
         with open(os.path.join(export_dir, ".gitattributes"), "w") as f:
             f.write("*.bin filter=lfs diff=lfs merge=lfs -text\n")
             f.write("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
             f.write("*.pt filter=lfs diff=lfs merge=lfs -text\n")
             f.write("*.pth filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("tokenizer.json filter=lfs diff=lfs merge=lfs -text\n")
+        logger.info("Created .gitattributes for Git LFS")
     except OSError as e:
         if "No space left on device" in str(e):
             logger.error("Not enough disk space to create .gitattributes")
         else:
-            raise
+            logger.error(f"Error creating .gitattributes: {str(e)}")
     
     # Create model card with YAML metadata
     try:
@@ -407,30 +408,56 @@ def export_model(model, tokenizer, export_dir):
             f.write("---\n")
             f.write("license: mit\n")
             f.write("tags:\n")
-            f.write("  - text-to-image\n")
-            f.write("  - diffusion\n")
-            f.write("  - wan2.1\n")
+            f.write("  - text-generation\n")
+            f.write("  - llama\n")
+            f.write("  - deepseek\n")
             f.write("  - fine-tuned\n")
-            f.write("library_name: diffusers\n")
-            f.write("pipeline_tag: text-to-image\n")
+            f.write("  - accounting\n")
+            f.write("library_name: transformers\n")
+            f.write("pipeline_tag: text-generation\n")
             f.write("---\n\n")
-            f.write("# Fine-Tuned Text-to-Image Model\n\n")
-            f.write("This model is a fine-tuned version based on Wan2.1-T2V-14B.\n\n")
-            f.write("## Note on Model Weights\n\n")
-            f.write("Due to disk space limitations, the full model weights may not be included in this repository.\n")
-            f.write("The model was fine-tuned on a custom dataset for 10 steps with a learning rate of 0.0001.\n\n")
+            f.write("# Fine-Tuned DeepSeek-R1-Distill-Llama-8B for Accounting\n\n")
+            f.write("This model is a fine-tuned version of DeepSeek-R1-Distill-Llama-8B optimized for accounting tasks.\n\n")
+            
+            # Add training parameters if available
+            if training_args:
+                f.write("## Training Parameters\n")
+                f.write(f"- Learning rate: {training_args.learning_rate}\n")
+                f.write(f"- Batch size: {training_args.per_device_train_batch_size}\n")
+                f.write(f"- Gradient accumulation steps: {training_args.gradient_accumulation_steps}\n")
+                f.write(f"- Training steps: {training_args.max_steps}\n")
+                f.write(f"- Optimizer: {training_args.optim}\n")
+                f.write(f"- Weight decay: {training_args.weight_decay}\n")
+                f.write(f"- LR scheduler: {training_args.lr_scheduler_type}\n\n")
+            
             f.write("## Loading\n```python\n")
-            f.write("from diffusers import DiffusionPipeline\n")
-            f.write('model = DiffusionPipeline.from_pretrained("your-username/text-image")\n')
-            f.write("```\n\n")
-            f.write("## Parameters\n- Steps: 10\n- Learning rate: 0.0001\n- Optimizer: adamw_8bit\n")
+            f.write("from transformers import AutoModelForCausalLM, AutoTokenizer\n")
+            f.write("import torch\n\n")
+            f.write("model = AutoModelForCausalLM.from_pretrained(\n")
+            f.write('    "path/to/model",\n')
+            f.write("    torch_dtype=torch.bfloat16,\n")
+            f.write("    device_map='auto'\n")
+            f.write(")\n")
+            f.write("tokenizer = AutoTokenizer.from_pretrained(\"path/to/model\")\n")
+            f.write("```\n")
+        logger.info("Created model card README.md")
     except OSError as e:
         if "No space left on device" in str(e):
             logger.error("Not enough disk space to create README.md")
         else:
-            raise
+            logger.error(f"Error creating README.md: {str(e)}")
     
-    logger.info(f"Model exported to {export_dir}")
+    # Save training configuration if available
+    if training_args:
+        try:
+            import json
+            with open(os.path.join(export_dir, "training_config.json"), "w") as f:
+                # Convert training args to dict and save as JSON
+                config_dict = training_args.to_dict()
+                json.dump(config_dict, f, indent=2)
+            logger.info("Saved training configuration")
+        except Exception as e:
+            logger.error(f"Error saving training configuration: {str(e)}")
     
     # List the files in the export directory to verify
     logger.info("Files in export directory:")
@@ -439,12 +466,23 @@ def export_model(model, tokenizer, export_dir):
             try:
                 file_path = os.path.join(root, file)
                 file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-                logger.info(f"  {file_path} ({file_size:.2f} MB)")
-            except:
+                logger.info(f"  {os.path.relpath(file_path, export_dir)} ({file_size:.2f} MB)")
+            except Exception:
                 logger.info(f"  {os.path.join(root, file)} (size unknown)")
+    
+    return abs_output_dir
 
 def upload_to_hf(export_dir, repo_id):
-    """Téléverse le modèle sur Hugging Face."""
+    """
+    Upload the model to Hugging Face Hub.
+    
+    Args:
+        export_dir: Directory containing the model
+        repo_id: Repository ID in format "username/model-name"
+    
+    Returns:
+        bool: True if upload was successful, False otherwise
+    """
     # Check for HF_TOKEN in environment
     hf_token = os.environ.get("HF_TOKEN")
     
@@ -467,8 +505,8 @@ def upload_to_hf(export_dir, repo_id):
     try:
         api.repo_info(repo_id=repo_id, repo_type="model")
         logger.info(f"Repository {repo_id} exists, uploading files...")
-    except Exception as e:
-        logger.info(f"Repository {repo_id} does not exist, creating it... ({str(e)})")
+    except Exception:
+        logger.info(f"Repository {repo_id} does not exist, creating it...")
         try:
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
             logger.info(f"Repository {repo_id} created successfully")
@@ -501,104 +539,112 @@ def upload_to_hf(export_dir, repo_id):
             logger.error(f"Failed to upload with CLI: {str(cli_error)}")
             return False
 
-def save_full_model(model, output_dir):
-    """Sauvegarde le modèle complet (base + LoRA) dans le dossier spécifié."""
+def save_full_model(model, output_dir, training_args=None):
+    """
+    Save the complete model (base + LoRA) to the specified directory.
+    Adapted for language models like DeepSeek-R1-Distill-Llama-8B.
+    
+    Args:
+        model: The model to save
+        output_dir: Directory to save the model to
+        training_args: Optional training arguments for metadata
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
     import torch
     import shutil
     from pathlib import Path
+    import json
     
     os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Sauvegarde du modèle complet dans {output_dir}...")
+    logger.info(f"Saving full model to {output_dir}...")
     
     try:
-        # Fusionner les poids LoRA avec le modèle de base
+        # Merge LoRA weights with base model if possible
         if hasattr(model, "merge_and_unload"):
-            logger.info("Fusion des poids LoRA avec le modèle de base...")
+            logger.info("Merging LoRA weights with base model...")
             merged_model = model.merge_and_unload()
             
-            # Sauvegarder le modèle fusionné
-            merged_model.save_pretrained(output_dir)
-            logger.info("Modèle fusionné sauvegardé avec succès.")
+            # Save the merged model
+            logger.info(f"Saving merged model to {output_dir}...")
+            merged_model.save_pretrained(
+                output_dir,
+                max_shard_size="4GB",
+                safe_serialization=True
+            )
+            logger.info("Merged model saved successfully.")
         else:
-            # Si le modèle n'a pas la méthode merge_and_unload, copier le modèle de base
-            # et les fichiers LoRA séparément
-            logger.info("Le modèle ne supporte pas la fusion directe. Copie des fichiers...")
+            # If the model doesn't support direct merging, copy base model
+            # and LoRA files separately
+            logger.info("Model doesn't support direct merging. Copying files...")
             
-            # Copier le modèle de base
-            base_model_dir = "./Wan2.1-T2V-14B"
-            if os.path.exists(base_model_dir):
-                for item in os.listdir(base_model_dir):
-                    s = os.path.join(base_model_dir, item)
-                    d = os.path.join(output_dir, item)
-                    
-                    if os.path.isdir(s):
-                        shutil.copytree(s, d, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(s, d)
-                
-                logger.info("Modèle de base copié avec succès.")
-            else:
-                logger.error(f"Dossier du modèle de base {base_model_dir} introuvable.")
-            
-            # Copier les fichiers LoRA
-            lora_dir = "./outputs/checkpoint-final"
-            if os.path.exists(lora_dir):
-                lora_output_dir = os.path.join(output_dir, "lora")
-                os.makedirs(lora_output_dir, exist_ok=True)
-                
-                for item in os.listdir(lora_dir):
-                    s = os.path.join(lora_dir, item)
-                    d = os.path.join(lora_output_dir, item)
-                    
-                    if os.path.isdir(s):
-                        shutil.copytree(s, d, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(s, d)
-                
-                logger.info("Fichiers LoRA copiés avec succès.")
-            else:
-                logger.warning(f"Dossier LoRA {lora_dir} introuvable.")
+            # For language models, we need to handle this differently
+            logger.error("Direct copying not implemented for this model type.")
+            logger.info("Please use the merge_and_unload method if available.")
+            return False
         
-        # Créer un fichier README.md avec des instructions d'utilisation
+        # Create a README.md with usage instructions
         readme_path = os.path.join(output_dir, "README.md")
         with open(readme_path, "w") as f:
-            f.write("# Modèle Wan2.1-T2V-14B Fine-Tuné\n\n")
-            f.write("Ce dossier contient le modèle Wan2.1-T2V-14B avec les poids fine-tunés.\n\n")
-            f.write("## Utilisation\n\n")
+            f.write("# Fine-Tuned DeepSeek-R1-Distill-Llama-8B Model\n\n")
+            f.write("This directory contains the DeepSeek-R1-Distill-Llama-8B model with fine-tuned weights.\n\n")
+            f.write("## Usage\n\n")
             f.write("```python\n")
-            f.write("from diffusers import DiffusionPipeline\n")
+            f.write("from transformers import AutoModelForCausalLM, AutoTokenizer\n")
             f.write("import torch\n\n")
-            f.write("# Charger le modèle\n")
-            f.write("model = DiffusionPipeline.from_pretrained(\n")
-            f.write("    '/workspace/full_model',\n")
-            f.write("    torch_dtype=torch.float16\n")
+            f.write("# Load the model\n")
+            f.write("model = AutoModelForCausalLM.from_pretrained(\n")
+            f.write("    'path/to/model',\n")
+            f.write("    torch_dtype=torch.bfloat16,\n")
+            f.write("    device_map='auto'\n")
             f.write(")\n")
-            f.write("model = model.to('cuda')\n\n")
-            f.write("# Générer une image\n")
-            f.write("prompt = 'A close-up portrait of a woman with medium-length auburn hair blowing in the wind'\n")
-            f.write("image = model(prompt).images[0]\n")
-            f.write("image.save('output.png')\n")
+            f.write("tokenizer = AutoTokenizer.from_pretrained('path/to/model')\n\n")
+            f.write("# Generate text\n")
+            f.write("prompt = \"\"\"Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n")
+            f.write("### Instruction:\n")
+            f.write("Tu es un expert comptable spécialisé dans le conseil aux entreprises. Tu dois fournir une réponse professionnelle et précise basée uniquement sur le contexte fourni.\n\n")
+            f.write("### Input:\n")
+            f.write("Type: Rapport financier\n")
+            f.write("Sujet: Analyse des résultats trimestriels\n")
+            f.write("Document: Les résultats du premier trimestre montrent une augmentation du chiffre d'affaires de 15% par rapport à l'année précédente, mais une baisse de la marge brute de 2 points.\n")
+            f.write("Question: Quelles pourraient être les causes de cette baisse de marge malgré l'augmentation du chiffre d'affaires?\n")
+            f.write("Source: Rapport interne\n\n")
+            f.write("### Response:\n")
+            f.write("\"\"\"\n\n")
+            f.write("inputs = tokenizer(prompt, return_tensors=\"pt\").to(model.device)\n")
+            f.write("outputs = model.generate(\n")
+            f.write("    **inputs,\n")
+            f.write("    max_new_tokens=512,\n")
+            f.write("    temperature=0.7,\n")
+            f.write("    top_p=0.9,\n")
+            f.write("    do_sample=True\n")
+            f.write(")\n")
+            f.write("response = tokenizer.decode(outputs[0], skip_special_tokens=True)\n")
+            f.write("print(response)\n")
             f.write("```\n")
         
-        logger.info("Fichier README.md créé avec succès.")
+        logger.info("README.md created successfully.")
         
-        # Créer un fichier de configuration pour l'inférence
-        config_path = os.path.join(output_dir, "inference_config.json")
-        import json
-        with open(config_path, "w") as f:
-            json.dump({
-                "model_type": "Wan2.1-T2V-14B",
-                "fine_tuned": True,
-                "inference_steps": 30,
-                "guidance_scale": 7.5,
-                "resolution": "832*480"
-            }, f, indent=2)
-        
-        logger.info("Fichier de configuration créé avec succès.")
+        # Create a configuration file for inference
+        if training_args:
+            config_path = os.path.join(output_dir, "inference_config.json")
+            with open(config_path, "w") as f:
+                json.dump({
+                    "model_type": "DeepSeek-R1-Distill-Llama-8B",
+                    "fine_tuned": True,
+                    "max_new_tokens": 512,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "learning_rate": training_args.learning_rate if hasattr(training_args, "learning_rate") else "unknown",
+                    "training_steps": training_args.max_steps if hasattr(training_args, "max_steps") else "unknown"
+                }, f, indent=2)
+            
+            logger.info("Configuration file created successfully.")
         
         return True
     except Exception as e:
-        logger.error(f"Erreur lors de la sauvegarde du modèle complet: {str(e)}")
+        logger.error(f"Error saving full model: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         return False
@@ -623,13 +669,13 @@ def main():
     
     # Exporter le modèle localement (LoRA seulement)
     export_dir = "hf_model_export"
-    export_model(model, tokenizer, export_dir)
+    export_model(model, tokenizer, export_dir, trainer.args)
     
     # Sauvegarder le modèle complet dans /workspace
     full_model_dir = "/workspace/full_model"
     logger.info(f"Sauvegarde du modèle complet dans {full_model_dir}...")
     try:
-        save_full_model(model, full_model_dir)
+        save_full_model(model, full_model_dir, trainer.args)
         logger.info(f"Modèle complet sauvegardé avec succès dans {full_model_dir}")
     except Exception as e:
         logger.error(f"Erreur lors de la sauvegarde du modèle complet: {str(e)}")
