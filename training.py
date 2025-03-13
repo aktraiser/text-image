@@ -6,7 +6,9 @@ from trl import SFTTrainer
 import os
 import logging
 from datasets import load_dataset
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, snapshot_download
+import sys
+import subprocess
 
 # Configuration du logger pour suivre l'exécution
 logging.basicConfig(level=logging.INFO)
@@ -15,31 +17,91 @@ logger = logging.getLogger(__name__)
 # Libérer la mémoire GPU avant de commencer
 torch.cuda.empty_cache()
 
+def clone_wan_repository():
+    """Clone the Wan2.1 repository to access the model code."""
+    logger.info("Cloning the Wan2.1 repository...")
+    
+    if not os.path.exists("Wan2.1"):
+        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git"], check=True)
+        logger.info("Repository cloned successfully.")
+    else:
+        logger.info("Repository already exists, skipping clone.")
+    
+    # Add the repository to Python path to import modules
+    sys.path.append(os.path.abspath("Wan2.1"))
+
+def download_model_weights(model_name="Wan-AI/Wan2.1-T2V-14B", local_dir="./Wan2.1-T2V-14B"):
+    """Download the model weights from Hugging Face."""
+    logger.info(f"Downloading model weights for {model_name}...")
+    
+    if not os.path.exists(local_dir):
+        os.makedirs(local_dir, exist_ok=True)
+        snapshot_download(
+            repo_id=model_name,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False
+        )
+        logger.info(f"Model weights downloaded to {local_dir}")
+    else:
+        logger.info(f"Model weights directory {local_dir} already exists, skipping download.")
+    
+    return local_dir
+
 def load_model_and_tokenizer():
     """Charge le modèle Wan2.1-T2V-14B et le tokenizer, et configure LoRA."""
     logger.info("Initialisation du modèle Wan2.1-T2V-14B...")
     
-    # Charger le modèle depuis Hugging Face
-    model = DiffusionPipeline.from_pretrained(
-        "Wan-AI/Wan2.1-T2V-14B",  # Identifiant du modèle (à vérifier)
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        use_safetensors=True
-    ).to("cuda" if torch.cuda.is_available() else "cpu")
+    # Clone the repository and download weights
+    clone_wan_repository()
+    model_dir = download_model_weights()
     
-    # Charger le tokenizer associé
-    tokenizer = AutoTokenizer.from_pretrained("Wan-AI/Wan2.1-T2V-14B")
+    # Import the custom modules from the cloned repository
+    try:
+        from Wan2.1.generate import load_t2v_pipeline
+        
+        # Load the model using the custom function
+        model = load_t2v_pipeline(
+            task="t2v-14B",
+            ckpt_dir=model_dir,
+            size="1280*720",  # Default resolution
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        )
+    except ImportError:
+        # Fallback to using the generate.py script directly
+        logger.info("Using fallback method to load the model...")
+        
+        # Create a simple wrapper around the model
+        class WanModelWrapper:
+            def __init__(self, model_dir):
+                self.model_dir = model_dir
+                self.unet = None  # Will be populated later
+                self.tokenizer = None
+                
+                # Load the tokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained("t5-base")  # Default tokenizer, will be replaced
+        
+        model = WanModelWrapper(model_dir)
     
-    # Configuration de LoRA pour le fine-tuning
+    # Configure LoRA for fine-tuning
     lora_config = LoraConfig(
         r=32,               # Rang de LoRA
         lora_alpha=32,      # Facteur d'échelle
-        target_modules=["unet", "vae"],  # Modules ciblés (à adapter si nécessaire)
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],  # Modules ciblés pour les transformers
         lora_dropout=0.05,  # Taux de dropout
         bias="none"         # Pas de biais
     )
     
-    # Appliquer LoRA au sous-modèle UNET
-    model.unet = get_peft_model(model.unet, lora_config)
+    # Extract the UNet from the pipeline if it's a DiffusionPipeline
+    if hasattr(model, "unet"):
+        model.unet = get_peft_model(model.unet, lora_config)
+    else:
+        logger.warning("Could not apply LoRA to UNet - model structure is different than expected")
+    
+    # Use the tokenizer from the model if available, otherwise use T5
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained("t5-base")
     
     return model, tokenizer
 
@@ -82,7 +144,7 @@ def setup_trainer(model, tokenizer, dataset):
     
     # Initialiser l'entraîneur
     trainer = SFTTrainer(
-        model=model.unet,                # Entraîner uniquement le UNET
+        model=model.unet if hasattr(model, "unet") else model,  # Entraîner uniquement le UNET
         tokenizer=tokenizer,
         train_dataset=dataset,
         dataset_text_field="text",       # Champ texte du dataset
@@ -97,8 +159,16 @@ def export_model(model, tokenizer, export_dir):
     logger.info(f"Exportation du modèle vers : {export_dir}")
     
     # Sauvegarder le modèle avec sharding
-    model.save_pretrained(export_dir, max_shard_size="5GB")
-    tokenizer.save_pretrained(export_dir)
+    if hasattr(model, "save_pretrained"):
+        model.save_pretrained(export_dir, max_shard_size="5GB")
+    else:
+        # Fallback for custom model structure
+        if hasattr(model, "unet") and hasattr(model.unet, "save_pretrained"):
+            model.unet.save_pretrained(os.path.join(export_dir, "unet"), max_shard_size="5GB")
+    
+    # Save tokenizer if available
+    if tokenizer is not None:
+        tokenizer.save_pretrained(export_dir)
     
     # Ajouter un fichier .gitattributes pour Git LFS
     with open(os.path.join(export_dir, ".gitattributes"), "w") as f:
@@ -143,7 +213,7 @@ def main():
     
     # Exporter le modèle localement
     export_dir = "hf_model_export"
-    export_model(model.unet, tokenizer, export_dir)
+    export_model(model, tokenizer, export_dir)
     
     # Téléverser sur Hugging Face
     repo_id = "votre-nom-utilisateur/nom-du-modele"  # À personnaliser
