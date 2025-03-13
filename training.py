@@ -10,6 +10,7 @@ from huggingface_hub import HfApi, snapshot_download
 import sys
 import subprocess
 import importlib.util
+from PIL import Image
 
 # Configuration du logger pour suivre l'exécution
 logging.basicConfig(level=logging.INFO)
@@ -147,47 +148,66 @@ def prepare_dataset(tokenizer, data_path="dataset"):
     """Charge et prépare le jeu de données à partir d'un dossier local."""
     logger.info(f"Chargement des données depuis : {data_path}")
     
-    # Charger le dataset depuis un dossier d'images
-    dataset = load_dataset("imagefolder", data_dir=data_path, split="train")
-    logger.info(f"Dataset chargé avec {len(dataset)} exemples.")
+    # First, let's examine the directory structure
+    logger.info("Examining dataset directory structure:")
+    files = os.listdir(data_path)
+    logger.info(f"Files in dataset directory: {files[:10]}...")
     
-    # Examine the dataset structure
-    sample = dataset[0]
-    logger.info(f"Dataset sample keys: {list(sample.keys())}")
-    for key in sample.keys():
-        logger.info(f"Sample '{key}': {sample[key]}")
+    # Create a custom dataset that pairs images with their text files
+    image_text_pairs = []
     
-    def preprocess_data(example):
-        """Ajoute un mot-clé déclencheur au texte."""
-        # For imagefolder datasets, the image filename might be in 'file_name'
-        # and we might need to extract text from filename or use image path
-        if 'file_name' in example:
-            # Extract text from filename (remove extension)
-            base_name = os.path.basename(example['file_name'])
-            text_from_filename = os.path.splitext(base_name)[0].replace('_', ' ')
-            text = f"{text_from_filename} TOK"
-        elif 'image_file_path' in example:
-            # Alternative field name
-            base_name = os.path.basename(example['image_file_path'])
-            text_from_filename = os.path.splitext(base_name)[0].replace('_', ' ')
-            text = f"{text_from_filename} TOK"
-        elif 'image' in example and hasattr(example['image'], 'filename'):
-            # Some datasets store filename in the image object
-            base_name = os.path.basename(example['image'].filename)
-            text_from_filename = os.path.splitext(base_name)[0].replace('_', ' ')
-            text = f"{text_from_filename} TOK"
-        else:
-            # Default fallback
-            text = "Image description TOK"
-        
-        return {"text": text}
+    for file in files:
+        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_path = os.path.join(data_path, file)
+            # Look for a corresponding text file
+            base_name = os.path.splitext(file)[0]
+            text_path = os.path.join(data_path, f"{base_name}.txt")
+            
+            if os.path.exists(text_path):
+                # Read the text file
+                with open(text_path, 'r', encoding='utf-8') as f:
+                    text_content = f.read().strip()
+                
+                # Add the pair to our dataset
+                image_text_pairs.append({
+                    "image_path": image_path,
+                    "text": text_content
+                })
+                logger.info(f"Paired image {file} with text: {text_content[:50]}...")
+            else:
+                # Use the filename as fallback text
+                image_text_pairs.append({
+                    "image_path": image_path,
+                    "text": base_name.replace('_', ' ')
+                })
+                logger.info(f"No text file for {file}, using filename as text")
     
-    # Préparer les données
-    dataset = dataset.map(preprocess_data)
+    logger.info(f"Created {len(image_text_pairs)} image-text pairs")
     
-    # Check the processed dataset
+    # Convert to HuggingFace dataset
+    from datasets import Dataset
+    dataset = Dataset.from_dict({
+        "image_path": [item["image_path"] for item in image_text_pairs],
+        "text": [item["text"] for item in image_text_pairs]
+    })
+    
+    # Load images
+    def load_image(example):
+        example["image"] = Image.open(example["image_path"]).convert("RGB")
+        return example
+    
+    dataset = dataset.map(load_image)
+    
+    # Add the trigger token to the text
+    def preprocess_text(example):
+        example["text"] = f"{example['text']} TOK"  # "TOK" comme mot déclencheur
+        return example
+    
+    dataset = dataset.map(preprocess_text)
+    
+    # Log a sample
     if len(dataset) > 0:
-        logger.info(f"Processed sample: {dataset[0]}")
+        logger.info(f"Sample: {dataset[0]}")
     
     return dataset
 
