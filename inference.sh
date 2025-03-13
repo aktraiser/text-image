@@ -10,10 +10,11 @@ PROMPT="$1"
 MODEL_DIR="${2:-./Wan2.1-T2V-14B}"
 OUTPUT_DIR="${3:-./generated_outputs}"
 
-# Installer les dépendances si nécessaire
+# Installer les dépendances nécessaires
 pip install torch torchvision torchaudio
 pip install diffusers transformers accelerate
 pip install safetensors
+pip install easydict einops decord opencv-python timm omegaconf imageio imageio-ffmpeg
 
 # Exécuter l'inférence
 python inference.py --prompt "$PROMPT" --model_dir "$MODEL_DIR" --output_dir "$OUTPUT_DIR"
