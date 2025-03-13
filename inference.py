@@ -13,6 +13,30 @@ from huggingface_hub import snapshot_download
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def install_dependencies():
+    """Installe les dépendances nécessaires pour le modèle Wan2.1."""
+    import subprocess
+    logger.info("Installation des dépendances pour Wan2.1...")
+    
+    dependencies = [
+        "easydict",
+        "einops",
+        "decord",
+        "opencv-python",
+        "timm",
+        "omegaconf",
+        "imageio",
+        "imageio-ffmpeg"
+    ]
+    
+    for dep in dependencies:
+        try:
+            logger.info(f"Installation de {dep}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", dep])
+            logger.info(f"{dep} installé avec succès")
+        except Exception as e:
+            logger.warning(f"Erreur lors de l'installation de {dep}: {str(e)}")
+
 def load_module_from_file(file_path, module_name):
     """Load a Python module from a file path."""
     spec = importlib.util.spec_from_file_location(module_name, file_path)
@@ -41,6 +65,9 @@ def load_model(model_dir="./Wan2.1-T2V-14B"):
     """Charge le modèle Wan2.1-T2V-14B."""
     logger.info(f"Chargement du modèle depuis {model_dir}...")
     
+    # Installer les dépendances nécessaires
+    install_dependencies()
+    
     # Vérifier si le modèle existe localement
     if not os.path.exists(model_dir):
         logger.info(f"Modèle non trouvé localement, téléchargement depuis Hugging Face...")
@@ -65,28 +92,42 @@ def load_model(model_dir="./Wan2.1-T2V-14B"):
         
         # Essayer d'importer le module de génération de Wan2.1
         try:
-            wan_module = load_module_from_file("Wan2_1/generate.py", "generate")
-            if wan_module:
-                logger.info("Module de génération Wan2.1 importé avec succès")
+            # Importer directement depuis le dépôt cloné
+            sys.path.insert(0, os.path.abspath("Wan2_1"))
+            
+            try:
+                import easydict
+                logger.info("Module easydict importé avec succès")
+            except ImportError:
+                logger.error("Module easydict non trouvé malgré l'installation")
+            
+            try:
+                from Wan2_1.generate import generate
+                logger.info("Module generate importé avec succès")
+                
                 # Créer une classe wrapper pour le modèle Wan
                 class WanModelWrapper:
                     def __init__(self, model_path):
                         self.model_path = model_path
-                        self.generate_module = wan_module
                     
                     def generate(self, prompt, **kwargs):
-                        return self.generate_module.generate(
+                        return generate(
                             self.model_path, 
                             prompt=prompt,
                             **kwargs
                         )
                 
-                return WanModelWrapper(model_dir)
-        except Exception as import_error:
-            logger.error(f"Erreur lors de l'importation du module Wan2.1: {str(import_error)}")
-    
-    except Exception as clone_error:
-        logger.error(f"Erreur lors du clonage du dépôt Wan2.1: {str(clone_error)}")
+                model = WanModelWrapper(model_dir)
+                logger.info("Modèle Wan2.1 chargé avec succès via le module generate")
+                return model
+                
+            except ImportError as e:
+                logger.error(f"Erreur lors de l'importation du module generate: {str(e)}")
+                
+        except Exception as e:
+            logger.error(f"Erreur lors de l'importation du module Wan2.1: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
     
     logger.error("Impossible de charger le modèle par aucune méthode")
     return None
