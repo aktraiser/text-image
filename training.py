@@ -281,6 +281,7 @@ def setup_trainer(model, tokenizer, dataset):
         logging_dir="./logs",            # Dossier des logs
         save_strategy="steps",           # Sauvegarde par étapes
         save_total_limit=3,              # Limite de sauvegardes
+        remove_unused_columns=False,     # Don't remove columns from dataset
     )
     
     trainer = Trainer(
