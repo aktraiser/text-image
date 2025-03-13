@@ -151,13 +151,44 @@ def prepare_dataset(tokenizer, data_path="dataset"):
     dataset = load_dataset("imagefolder", data_dir=data_path, split="train")
     logger.info(f"Dataset chargé avec {len(dataset)} exemples.")
     
+    # Examine the dataset structure
+    sample = dataset[0]
+    logger.info(f"Dataset sample keys: {list(sample.keys())}")
+    for key in sample.keys():
+        logger.info(f"Sample '{key}': {sample[key]}")
+    
     def preprocess_data(example):
         """Ajoute un mot-clé déclencheur au texte."""
-        text = f"{example['text']} TOK"  # "TOK" comme mot déclencheur
+        # For imagefolder datasets, the image filename might be in 'file_name'
+        # and we might need to extract text from filename or use image path
+        if 'file_name' in example:
+            # Extract text from filename (remove extension)
+            base_name = os.path.basename(example['file_name'])
+            text_from_filename = os.path.splitext(base_name)[0].replace('_', ' ')
+            text = f"{text_from_filename} TOK"
+        elif 'image_file_path' in example:
+            # Alternative field name
+            base_name = os.path.basename(example['image_file_path'])
+            text_from_filename = os.path.splitext(base_name)[0].replace('_', ' ')
+            text = f"{text_from_filename} TOK"
+        elif 'image' in example and hasattr(example['image'], 'filename'):
+            # Some datasets store filename in the image object
+            base_name = os.path.basename(example['image'].filename)
+            text_from_filename = os.path.splitext(base_name)[0].replace('_', ' ')
+            text = f"{text_from_filename} TOK"
+        else:
+            # Default fallback
+            text = "Image description TOK"
+        
         return {"text": text}
     
     # Préparer les données
     dataset = dataset.map(preprocess_data)
+    
+    # Check the processed dataset
+    if len(dataset) > 0:
+        logger.info(f"Processed sample: {dataset[0]}")
+    
     return dataset
 
 def setup_trainer(model, tokenizer, dataset):
