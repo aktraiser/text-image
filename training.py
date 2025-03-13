@@ -12,6 +12,8 @@ import subprocess
 import importlib.util
 from PIL import Image
 import shutil
+import glob
+import json
 
 # Configuration du logger pour suivre l'exécution
 logging.basicConfig(level=logging.INFO)
@@ -541,110 +543,111 @@ def upload_to_hf(export_dir, repo_id):
 
 def save_full_model(model, output_dir, training_args=None):
     """
-    Save the complete model (base + LoRA) to the specified directory.
-    Adapted for language models like DeepSeek-R1-Distill-Llama-8B.
+    Sauvegarde le modèle complet en copiant les fichiers du modèle de base et en ajoutant les poids LoRA.
     
     Args:
-        model: The model to save
-        output_dir: Directory to save the model to
-        training_args: Optional training arguments for metadata
-    
+        model: Le modèle à sauvegarder
+        output_dir: Répertoire de destination
+        training_args: Arguments d'entraînement (optionnel)
+        
     Returns:
-        bool: True if successful, False otherwise
+        bool: True si la sauvegarde a réussi, False sinon
     """
-    import torch
-    import shutil
-    from pathlib import Path
-    import json
-    
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Saving full model to {output_dir}...")
+    logger.info(f"Sauvegarde du modèle complet dans {output_dir}...")
     
     try:
-        # Merge LoRA weights with base model if possible
-        if hasattr(model, "merge_and_unload"):
-            logger.info("Merging LoRA weights with base model...")
-            merged_model = model.merge_and_unload()
-            
-            # Save the merged model
-            logger.info(f"Saving merged model to {output_dir}...")
-            merged_model.save_pretrained(
-                output_dir,
-                max_shard_size="4GB",
-                safe_serialization=True
-            )
-            logger.info("Merged model saved successfully.")
-        else:
-            # If the model doesn't support direct merging, copy base model
-            # and LoRA files separately
-            logger.info("Model doesn't support direct merging. Copying files...")
-            
-            # For language models, we need to handle this differently
-            logger.error("Direct copying not implemented for this model type.")
-            logger.info("Please use the merge_and_unload method if available.")
+        # Créer le répertoire de sortie s'il n'existe pas
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 1. Copier les fichiers du modèle de base
+        base_model_dir = "./Wan2.1-T2V-14B"
+        if not os.path.exists(base_model_dir):
+            logger.error(f"Le répertoire du modèle de base {base_model_dir} n'existe pas")
             return False
         
-        # Create a README.md with usage instructions
-        readme_path = os.path.join(output_dir, "README.md")
-        with open(readme_path, "w") as f:
-            f.write("# Fine-Tuned DeepSeek-R1-Distill-Llama-8B Model\n\n")
-            f.write("This directory contains the DeepSeek-R1-Distill-Llama-8B model with fine-tuned weights.\n\n")
-            f.write("## Usage\n\n")
-            f.write("```python\n")
-            f.write("from transformers import AutoModelForCausalLM, AutoTokenizer\n")
-            f.write("import torch\n\n")
-            f.write("# Load the model\n")
-            f.write("model = AutoModelForCausalLM.from_pretrained(\n")
-            f.write("    'path/to/model',\n")
-            f.write("    torch_dtype=torch.bfloat16,\n")
-            f.write("    device_map='auto'\n")
-            f.write(")\n")
-            f.write("tokenizer = AutoTokenizer.from_pretrained('path/to/model')\n\n")
-            f.write("# Generate text\n")
-            f.write("prompt = \"\"\"Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n")
-            f.write("### Instruction:\n")
-            f.write("Tu es un expert comptable spécialisé dans le conseil aux entreprises. Tu dois fournir une réponse professionnelle et précise basée uniquement sur le contexte fourni.\n\n")
-            f.write("### Input:\n")
-            f.write("Type: Rapport financier\n")
-            f.write("Sujet: Analyse des résultats trimestriels\n")
-            f.write("Document: Les résultats du premier trimestre montrent une augmentation du chiffre d'affaires de 15% par rapport à l'année précédente, mais une baisse de la marge brute de 2 points.\n")
-            f.write("Question: Quelles pourraient être les causes de cette baisse de marge malgré l'augmentation du chiffre d'affaires?\n")
-            f.write("Source: Rapport interne\n\n")
-            f.write("### Response:\n")
-            f.write("\"\"\"\n\n")
-            f.write("inputs = tokenizer(prompt, return_tensors=\"pt\").to(model.device)\n")
-            f.write("outputs = model.generate(\n")
-            f.write("    **inputs,\n")
-            f.write("    max_new_tokens=512,\n")
-            f.write("    temperature=0.7,\n")
-            f.write("    top_p=0.9,\n")
-            f.write("    do_sample=True\n")
-            f.write(")\n")
-            f.write("response = tokenizer.decode(outputs[0], skip_special_tokens=True)\n")
-            f.write("print(response)\n")
-            f.write("```\n")
+        # Liste des fichiers à copier
+        files_to_copy = [
+            "Wan2.1_VAE.pth",
+            "config.json",
+            "diffusion_pytorch_model-00001-of-00006.safetensors",
+            "diffusion_pytorch_model-00002-of-00006.safetensors",
+            "diffusion_pytorch_model-00003-of-00006.safetensors",
+            "diffusion_pytorch_model-00004-of-00006.safetensors",
+            "diffusion_pytorch_model-00005-of-00006.safetensors",
+            "diffusion_pytorch_model-00006-of-00006.safetensors",
+            "diffusion_pytorch_model.safetensors.index.json",
+            "models_t5_umt5-xxl-enc-bf16.pth"
+        ]
         
-        logger.info("README.md created successfully.")
+        # Copier chaque fichier
+        for file_name in files_to_copy:
+            src_path = os.path.join(base_model_dir, file_name)
+            dst_path = os.path.join(output_dir, file_name)
+            
+            if os.path.exists(src_path):
+                logger.info(f"Copie de {file_name}...")
+                shutil.copy2(src_path, dst_path)
+            else:
+                logger.warning(f"Fichier {file_name} non trouvé dans le modèle de base")
         
-        # Create a configuration file for inference
-        if training_args:
-            config_path = os.path.join(output_dir, "inference_config.json")
-            with open(config_path, "w") as f:
-                json.dump({
-                    "model_type": "DeepSeek-R1-Distill-Llama-8B",
-                    "fine_tuned": True,
-                    "max_new_tokens": 512,
-                    "temperature": 0.7,
-                    "top_p": 0.9,
+        # 2. Trouver et copier les poids LoRA
+        lora_files = []
+        
+        # Chercher dans les checkpoints
+        if os.path.exists("outputs"):
+            lora_files.extend(glob.glob("outputs/checkpoint-*/*.safetensors"))
+            # Trier par date de modification (le plus récent en dernier)
+            lora_files = sorted(lora_files, key=os.path.getmtime)
+        
+        if not lora_files:
+            logger.warning("Aucun fichier LoRA trouvé")
+            return False
+        
+        # Utiliser le fichier LoRA le plus récent
+        latest_lora = lora_files[-1]
+        logger.info(f"Utilisation du fichier LoRA le plus récent: {latest_lora}")
+        
+        # Copier le fichier LoRA dans le répertoire de sortie
+        lora_dest = os.path.join(output_dir, "lora.safetensors")
+        shutil.copy2(latest_lora, lora_dest)
+        logger.info(f"Fichier LoRA copié vers: {lora_dest}")
+        
+        # 3. Créer un fichier de configuration pour l'inférence
+        config_path = os.path.join(output_dir, "inference_config.json")
+        with open(config_path, "w") as f:
+            config = {
+                "model_type": "Wan2.1-T2V-14B",
+                "fine_tuned": True,
+                "lora_path": "lora.safetensors",
+                "lora_scale": 0.8  # Valeur par défaut
+            }
+            
+            # Ajouter les paramètres d'entraînement si disponibles
+            if training_args:
+                config.update({
                     "learning_rate": training_args.learning_rate if hasattr(training_args, "learning_rate") else "unknown",
                     "training_steps": training_args.max_steps if hasattr(training_args, "max_steps") else "unknown"
-                }, f, indent=2)
+                })
             
-            logger.info("Configuration file created successfully.")
+            json.dump(config, f, indent=2)
         
+        logger.info(f"Configuration d'inférence sauvegardée dans: {config_path}")
+        
+        # 4. Créer un README simple
+        readme_path = os.path.join(output_dir, "README.md")
+        with open(readme_path, "w") as f:
+            f.write("# Modèle Wan2.1 Fine-Tuné\n\n")
+            f.write("Ce dossier contient le modèle Wan2.1-T2V-14B avec les poids LoRA.\n\n")
+            f.write("Pour l'inférence, utilisez le script `inference.sh` :\n\n")
+            f.write("```bash\n")
+            f.write("./inference.sh \"Votre prompt ici\"\n")
+            f.write("```\n")
+        
+        logger.info("Modèle complet sauvegardé avec succès")
         return True
+        
     except Exception as e:
-        logger.error(f"Error saving full model: {str(e)}")
+        logger.error(f"Erreur lors de la sauvegarde du modèle complet: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         return False
@@ -667,20 +670,34 @@ def main():
     logger.info("Lancement de l'entraînement...")
     trainer.train()
     
+    # Sauvegarde du modèle final
+    if training_args.output_dir:
+        logger.info("Sauvegarde du modèle final...")
+        trainer.save_model()
+        
+        # Sauvegarde du modèle complet (base + LoRA)
+        full_model_dir = os.path.join(training_args.output_dir, "full_model")
+        success = save_full_model(model, full_model_dir, training_args)
+        
+        if success:
+            logger.info(f"Modèle complet sauvegardé avec succès dans: {full_model_dir}")
+            logger.info("\n" + "="*80)
+            logger.info("UTILISATION DU MODÈLE:")
+            logger.info(f"1. Accédez au dossier du modèle: cd {full_model_dir}")
+            logger.info("2. Exécutez l'inférence avec la commande:")
+            logger.info(f"   ../inference.sh \"Votre prompt ici\"")
+            logger.info("="*80 + "\n")
+        else:
+            logger.warning("La sauvegarde du modèle complet a échoué.")
+            logger.info("\n" + "="*80)
+            logger.info("UTILISATION DU MODÈLE AVEC LORA:")
+            logger.info("Utilisez le script direct_inference.py avec les poids LoRA:")
+            logger.info("./inference.sh \"Votre prompt ici\"")
+            logger.info("="*80 + "\n")
+    
     # Exporter le modèle localement (LoRA seulement)
     export_dir = "hf_model_export"
     export_model(model, tokenizer, export_dir, trainer.args)
-    
-    # Sauvegarder le modèle complet dans /workspace
-    full_model_dir = "/workspace/full_model"
-    logger.info(f"Sauvegarde du modèle complet dans {full_model_dir}...")
-    try:
-        save_full_model(model, full_model_dir, trainer.args)
-        logger.info(f"Modèle complet sauvegardé avec succès dans {full_model_dir}")
-    except Exception as e:
-        logger.error(f"Erreur lors de la sauvegarde du modèle complet: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
     
     # Ask user if they want to upload to Hugging Face
     upload_choice = input("Do you want to upload the model to Hugging Face? (yes/no): ")
