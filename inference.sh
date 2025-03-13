@@ -15,6 +15,8 @@ pip install torch torchvision torchaudio
 pip install diffusers transformers accelerate
 pip install safetensors
 pip install easydict einops decord opencv-python timm omegaconf imageio imageio-ffmpeg
+pip install ftfy regex tqdm matplotlib scikit-image lpips kornia
+pip install av
 
 # Exécuter l'inférence
 python inference.py --prompt "$PROMPT" --model_dir "$MODEL_DIR" --output_dir "$OUTPUT_DIR"
