@@ -300,6 +300,12 @@ def export_model(model, tokenizer, export_dir):
     os.makedirs(export_dir, exist_ok=True)
     logger.info(f"Exportation du modèle vers : {export_dir}")
     
+    # Check available disk space
+    import shutil
+    total, used, free = shutil.disk_usage("/")
+    free_gb = free / (1024**3)  # Convert to GB
+    logger.info(f"Available disk space: {free_gb:.2f} GB")
+    
     # Import safetensors explicitly
     try:
         import safetensors
@@ -339,55 +345,90 @@ def export_model(model, tokenizer, export_dir):
         else:
             logger.warning("Could not find a valid model component to save")
             
-            # Copy the original model files if we can't save our own
+            # Copy only essential model files if disk space is limited
             try:
-                logger.info("Copying original model files from Wan2.1-T2V-14B")
+                logger.info("Copying essential model files from Wan2.1-T2V-14B")
                 model_dir = "./Wan2.1-T2V-14B"
                 
-                # Copy safetensors files
-                for file in os.listdir(model_dir):
-                    if file.endswith(".safetensors") or file.endswith(".json") or file.endswith(".pth"):
-                        src_path = os.path.join(model_dir, file)
-                        dst_path = os.path.join(export_dir, file)
-                        if os.path.isfile(src_path):
-                            logger.info(f"Copying {file} to export directory")
-                            shutil.copy2(src_path, dst_path)
+                # Only copy config and metadata files, not the large model weights
+                essential_files = [
+                    "config.json", 
+                    "diffusion_pytorch_model.safetensors.index.json",
+                    # Add any other small essential files here
+                ]
                 
-                logger.info("Original model files copied successfully")
+                # Copy only essential files
+                for file in essential_files:
+                    src_path = os.path.join(model_dir, file)
+                    dst_path = os.path.join(export_dir, file)
+                    if os.path.isfile(src_path):
+                        logger.info(f"Copying {file} to export directory")
+                        shutil.copy2(src_path, dst_path)
+                
+                # Create a placeholder for model weights
+                with open(os.path.join(export_dir, "MODEL_WEIGHTS_NOT_INCLUDED.txt"), "w") as f:
+                    f.write("The model weights were not included in this export due to disk space limitations.\n")
+                    f.write("Please download the original model weights from: https://huggingface.co/Wan-AI/Wan2.1-T2V-14B\n")
+                
+                logger.info("Essential model files copied successfully")
             except Exception as copy_error:
-                logger.error(f"Error copying original model files: {str(copy_error)}")
+                logger.error(f"Error copying essential model files: {str(copy_error)}")
     
     # Save tokenizer if available
     if tokenizer is not None:
-        logger.info("Saving tokenizer")
-        tokenizer.save_pretrained(export_dir)
+        try:
+            logger.info("Saving tokenizer")
+            tokenizer.save_pretrained(export_dir)
+        except OSError as e:
+            if "No space left on device" in str(e):
+                logger.error("Not enough disk space to save tokenizer")
+                # Create a placeholder for tokenizer
+                with open(os.path.join(export_dir, "TOKENIZER_NOT_INCLUDED.txt"), "w") as f:
+                    f.write("The tokenizer was not included in this export due to disk space limitations.\n")
+            else:
+                raise
     
     # Ajouter un fichier .gitattributes pour Git LFS
-    with open(os.path.join(export_dir, ".gitattributes"), "w") as f:
-        f.write("*.bin filter=lfs diff=lfs merge=lfs -text\n")
-        f.write("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
-        f.write("*.pt filter=lfs diff=lfs merge=lfs -text\n")
-        f.write("*.pth filter=lfs diff=lfs merge=lfs -text\n")
+    try:
+        with open(os.path.join(export_dir, ".gitattributes"), "w") as f:
+            f.write("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.pt filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.pth filter=lfs diff=lfs merge=lfs -text\n")
+    except OSError as e:
+        if "No space left on device" in str(e):
+            logger.error("Not enough disk space to create .gitattributes")
+        else:
+            raise
     
     # Create model card with YAML metadata
-    with open(os.path.join(export_dir, "README.md"), "w") as f:
-        f.write("---\n")
-        f.write("license: mit\n")
-        f.write("tags:\n")
-        f.write("  - text-to-image\n")
-        f.write("  - diffusion\n")
-        f.write("  - wan2.1\n")
-        f.write("  - fine-tuned\n")
-        f.write("library_name: diffusers\n")
-        f.write("pipeline_tag: text-to-image\n")
-        f.write("---\n\n")
-        f.write("# Fine-Tuned Text-to-Image Model\n\n")
-        f.write("This model is a fine-tuned version based on Wan2.1-T2V-14B.\n\n")
-        f.write("## Loading\n```python\n")
-        f.write("from diffusers import DiffusionPipeline\n")
-        f.write('model = DiffusionPipeline.from_pretrained("your-username/text-image")\n')
-        f.write("```\n\n")
-        f.write("## Parameters\n- Steps: 10\n- Learning rate: 0.0001\n- Optimizer: adamw_8bit\n")
+    try:
+        with open(os.path.join(export_dir, "README.md"), "w") as f:
+            f.write("---\n")
+            f.write("license: mit\n")
+            f.write("tags:\n")
+            f.write("  - text-to-image\n")
+            f.write("  - diffusion\n")
+            f.write("  - wan2.1\n")
+            f.write("  - fine-tuned\n")
+            f.write("library_name: diffusers\n")
+            f.write("pipeline_tag: text-to-image\n")
+            f.write("---\n\n")
+            f.write("# Fine-Tuned Text-to-Image Model\n\n")
+            f.write("This model is a fine-tuned version based on Wan2.1-T2V-14B.\n\n")
+            f.write("## Note on Model Weights\n\n")
+            f.write("Due to disk space limitations, the full model weights may not be included in this repository.\n")
+            f.write("The model was fine-tuned on a custom dataset for 10 steps with a learning rate of 0.0001.\n\n")
+            f.write("## Loading\n```python\n")
+            f.write("from diffusers import DiffusionPipeline\n")
+            f.write('model = DiffusionPipeline.from_pretrained("your-username/text-image")\n')
+            f.write("```\n\n")
+            f.write("## Parameters\n- Steps: 10\n- Learning rate: 0.0001\n- Optimizer: adamw_8bit\n")
+    except OSError as e:
+        if "No space left on device" in str(e):
+            logger.error("Not enough disk space to create README.md")
+        else:
+            raise
     
     logger.info(f"Model exported to {export_dir}")
     
@@ -395,9 +436,12 @@ def export_model(model, tokenizer, export_dir):
     logger.info("Files in export directory:")
     for root, dirs, files in os.walk(export_dir):
         for file in files:
-            file_path = os.path.join(root, file)
-            file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-            logger.info(f"  {file_path} ({file_size:.2f} MB)")
+            try:
+                file_path = os.path.join(root, file)
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
+                logger.info(f"  {file_path} ({file_size:.2f} MB)")
+            except:
+                logger.info(f"  {os.path.join(root, file)} (size unknown)")
 
 def upload_to_hf(export_dir, repo_id):
     """Téléverse le modèle sur Hugging Face."""
