@@ -1,12 +1,15 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from diffusers import DiffusionPipeline
 import json
 import os
 import argparse
 import logging
 import time
 from pathlib import Path
-import pandas as pd
+import sys
+import importlib.util
+import subprocess
+from huggingface_hub import snapshot_download
 
 # Configuration du logger
 logging.basicConfig(
@@ -19,8 +22,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Afficher un message d'information sur les chemins de modèle
+logger.info("""
+==========================================================
+INFORMATION SUR LES CHEMINS DE MODÈLE:
+- Modèle complet: /workspace/full_model (recommandé)
+- Poids LoRA uniquement: hf_model_export
+==========================================================
+""")
+
 # Désactiver le parallélisme des tokenizers pour éviter les warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Libérer la mémoire GPU avant de commencer
+torch.cuda.empty_cache()
+
+def clone_wan_repository():
+    """Clone the Wan2.1 repository to access the model code."""
+    logger.info("Cloning the Wan2.1 repository...")
+    
+    if not os.path.exists("Wan2_1"):  # Changed directory name to avoid the dot
+        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git", "Wan2_1"], check=True)
+        logger.info("Repository cloned successfully.")
+    else:
+        logger.info("Repository already exists, skipping clone.")
+    
+    # Add the repository to Python path to import modules
+    sys.path.append(os.path.abspath("Wan2_1"))
+
+def load_module_from_file(file_path, module_name):
+    """Load a Python module from a file path."""
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None:
+        return None
+    
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+def download_model_weights(model_name="Wan-AI/Wan2.1-T2V-14B", local_dir="./Wan2.1-T2V-14B"):
+    """Download the model weights from Hugging Face."""
+    logger.info(f"Downloading model weights for {model_name}...")
+    
+    if not os.path.exists(local_dir):
+        os.makedirs(local_dir, exist_ok=True)
+        snapshot_download(
+            repo_id=model_name,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False
+        )
+        logger.info(f"Model weights downloaded to {local_dir}")
+    else:
+        logger.info(f"Model weights directory {local_dir} already exists, skipping download.")
+    
+    return local_dir
 
 def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=None):
     """
@@ -33,7 +88,7 @@ def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=
         device: Périphérique à utiliser (None pour auto-détection)
         
     Returns:
-        tuple: (model, tokenizer)
+        tuple: (model, tokenizer, inference_config)
     """
     start_time = time.time()
     logger.info(f"Chargement du modèle depuis {model_path}")
@@ -70,17 +125,85 @@ def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=
         except Exception as e:
             logger.warning(f"Erreur lors du chargement de la configuration d'inférence: {e}")
     
-    # Charger le tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        logger.info("Tokenizer chargé avec succès")
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement du tokenizer: {e}")
-        raise
+    # Vérifier si nous avons un modèle Wan2.1
+    is_wan_model = False
+    if os.path.exists(os.path.join(model_path, "unet")) or "Wan" in model_path:
+        is_wan_model = True
+        logger.info("Détection d'un modèle Wan2.1")
     
-    # Charger le modèle
-    try:
-        # Vérifier si nous utilisons Unsloth
+    # Charger le modèle en fonction de son type
+    if is_wan_model:
+        # Cloner le dépôt Wan2.1 si nécessaire
+        clone_wan_repository()
+        
+        try:
+            # Essayer de charger le module generate.py directement
+            generate_module = load_module_from_file(os.path.join("Wan2_1", "generate.py"), "generate")
+            
+            if generate_module and hasattr(generate_module, "load_t2v_pipeline"):
+                # Charger le modèle avec la fonction personnalisée
+                model = generate_module.load_t2v_pipeline(
+                    task="t2v-14B",
+                    ckpt_dir=model_path,
+                    size="1280*720",  # Résolution par défaut
+                    device=device,
+                    dtype=dtype
+                )
+                logger.info("Modèle chargé avec succès via la pipeline personnalisée")
+                
+                # Charger le tokenizer
+                from transformers import AutoTokenizer
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_path, "tokenizer"))
+                    logger.info("Tokenizer chargé avec succès")
+                except Exception:
+                    logger.warning("Impossible de charger le tokenizer, utilisation de t5-base comme fallback")
+                    tokenizer = AutoTokenizer.from_pretrained("t5-base")
+            else:
+                raise ImportError("Impossible de trouver la fonction load_t2v_pipeline")
+                
+        except (ImportError, FileNotFoundError) as e:
+            # Fallback à une approche directe
+            logger.info(f"Utilisation de la méthode de fallback pour charger le modèle: {str(e)}")
+            
+            # Créer un wrapper simple autour du modèle
+            from transformers import AutoTokenizer
+            from diffusers import UNet2DConditionModel
+            
+            class WanModelWrapper:
+                def __init__(self, model_dir):
+                    self.model_dir = model_dir
+                    self.unet = None
+                    self.tokenizer = None
+                    
+                    # Essayer de charger le composant UNet directement
+                    try:
+                        self.unet = UNet2DConditionModel.from_pretrained(
+                            os.path.join(model_dir, "unet"),
+                            torch_dtype=dtype
+                        )
+                        logger.info("Composant UNet chargé avec succès")
+                    except Exception as unet_error:
+                        logger.warning(f"Impossible de charger l'UNet: {str(unet_error)}")
+                    
+                    # Charger le tokenizer
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+                        logger.info("Tokenizer chargé avec succès")
+                    except Exception:
+                        logger.warning("Impossible de charger le tokenizer, utilisation de t5-base comme fallback")
+                        self.tokenizer = AutoTokenizer.from_pretrained("t5-base")
+                
+                def generate(self, **kwargs):
+                    # Implémentation simplifiée de la génération
+                    logger.info("Génération avec le modèle Wan")
+                    # Cette méthode devrait être adaptée en fonction des besoins spécifiques
+                    return kwargs.get("input_ids", None)
+            
+            model = WanModelWrapper(model_path)
+            tokenizer = model.tokenizer
+    else:
+        # Charger un modèle standard avec Unsloth si disponible
         try:
             from unsloth import FastLanguageModel
             logger.info("Utilisation de Unsloth FastLanguageModel pour le chargement")
@@ -93,22 +216,23 @@ def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=
             )
         except ImportError:
             # Fallback à la méthode standard si Unsloth n'est pas disponible
+            from transformers import AutoModelForCausalLM, AutoTokenizer
             logger.info("Unsloth non disponible, utilisation de AutoModelForCausalLM standard")
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=dtype,
                 load_in_4bit=load_in_4bit,
                 device_map="auto" if device == "cuda" else device
             )
-        
-        logger.info(f"Modèle chargé avec succès en {time.time() - start_time:.2f} secondes")
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement du modèle: {e}")
-        raise
     
     # Mettre le modèle en mode évaluation
-    model.eval()
+    if hasattr(model, "eval"):
+        model.eval()
+    elif hasattr(model, "unet") and hasattr(model.unet, "eval"):
+        model.unet.eval()
     
+    logger.info(f"Modèle chargé avec succès en {time.time() - start_time:.2f} secondes")
     return model, tokenizer, inference_config
 
 def generate_response(model, tokenizer, prompt, inference_config=None, **kwargs):
@@ -147,17 +271,25 @@ def generate_response(model, tokenizer, prompt, inference_config=None, **kwargs)
     generation_config.update(kwargs)
     
     # Encoder le prompt
-    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(model.device)
+    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(model.device if hasattr(model, "device") else "cuda" if torch.cuda.is_available() else "cpu")
     
     # Générer la réponse
     with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=input_ids,
-            **generation_config
-        )
-    
-    # Décoder la réponse (en ignorant le prompt)
-    output_text = tokenizer.decode(output_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        # Vérifier si nous avons un modèle Wan ou un modèle standard
+        if hasattr(model, "unet") and not hasattr(model, "generate"):
+            # Pour les modèles Wan, nous devons implémenter une logique spécifique
+            logger.info("Génération avec un modèle Wan (non implémentée)")
+            # Cette partie devrait être adaptée en fonction des besoins spécifiques
+            output_text = "La génération avec ce modèle Wan n'est pas encore implémentée."
+        else:
+            # Pour les modèles standard
+            output_ids = model.generate(
+                input_ids=input_ids,
+                **generation_config
+            )
+            
+            # Décoder la réponse (en ignorant le prompt)
+            output_text = tokenizer.decode(output_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
     
     return output_text
 
@@ -170,19 +302,15 @@ def interactive_evaluation(model, tokenizer, inference_config=None):
         tokenizer: Le tokenizer à utiliser
         inference_config: Configuration d'inférence (optionnel)
     """
-    prompt_template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+    prompt_template = """Tu es un expert en fiscalité, comptabilité, ton objectif et d'accompagner les entreprises dans leur enjeux. 
 
-### Instruction:
-Tu es un expert comptable spécialisé dans le conseil aux entreprises. Tu dois fournir une réponse professionnelle et précise basée uniquement sur le contexte fourni.
+### Texte principal:
+{texte}
 
-### Input:
-Type: {content_type}
-Sujet: {title}
-Document: {main_text}
-Question: {questions}
-Source: {source}
+### Question:
+{question}
 
-### Response:
+### Réponse:
 """
     
     print("\n" + "="*80)
@@ -192,33 +320,18 @@ Source: {source}
     
     while True:
         try:
-            content_type = input("\nType de contenu (ex: Rapport financier): ")
-            if content_type.lower() == 'exit':
+            texte = input("\nEntrez le texte principal (ou 'exit' pour quitter) : ")
+            if texte.lower() == 'exit':
                 break
                 
-            title = input("Sujet: ")
-            if title.lower() == 'exit':
-                break
-                
-            main_text = input("Document principal: ")
-            if main_text.lower() == 'exit':
-                break
-                
-            questions = input("Question: ")
-            if questions.lower() == 'exit':
-                break
-                
-            source = input("Source (optionnel): ")
-            if source.lower() == 'exit':
+            question = input("Entrez la question : ")
+            if question.lower() == 'exit':
                 break
             
             # Construire le prompt
             prompt = prompt_template.format(
-                content_type=content_type,
-                title=title,
-                main_text=main_text,
-                questions=questions,
-                source=source
+                texte=texte,
+                question=question
             )
             
             print("\nGénération de la réponse...")
@@ -241,115 +354,13 @@ Source: {source}
             logger.error(f"Erreur lors de la génération: {e}")
             print(f"\nUne erreur s'est produite: {e}")
 
-def batch_evaluation_from_file(model, tokenizer, input_file, output_file=None, inference_config=None):
-    """
-    Évalue le modèle sur un lot de données à partir d'un fichier CSV.
-    
-    Args:
-        model: Le modèle à utiliser
-        tokenizer: Le tokenizer à utiliser
-        input_file: Chemin vers le fichier CSV d'entrée
-        output_file: Chemin vers le fichier CSV de sortie (optionnel)
-        inference_config: Configuration d'inférence (optionnel)
-    """
-    # Vérifier si le fichier existe
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Le fichier d'entrée {input_file} n'existe pas")
-    
-    # Charger les données
-    try:
-        df = pd.read_csv(input_file)
-        logger.info(f"Fichier chargé avec succès: {len(df)} lignes")
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement du fichier: {e}")
-        raise
-    
-    # Vérifier les colonnes requises
-    required_columns = ['content_type', 'title', 'main_text', 'questions']
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"Colonnes manquantes dans le fichier CSV: {missing_columns}")
-    
-    # Ajouter une colonne 'source' si elle n'existe pas
-    if 'source' not in df.columns:
-        df['source'] = ""
-    
-    # Ajouter une colonne pour les réponses
-    df['model_response'] = ""
-    df['generation_time'] = 0.0
-    
-    # Template de prompt
-    prompt_template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-### Instruction:
-Tu es un expert comptable spécialisé dans le conseil aux entreprises. Tu dois fournir une réponse professionnelle et précise basée uniquement sur le contexte fourni.
-
-### Input:
-Type: {content_type}
-Sujet: {title}
-Document: {main_text}
-Question: {questions}
-Source: {source}
-
-### Response:
-"""
-    
-    # Générer les réponses
-    total_start_time = time.time()
-    for i, row in df.iterrows():
-        try:
-            # Construire le prompt
-            prompt = prompt_template.format(
-                content_type=row['content_type'],
-                title=row['title'],
-                main_text=row['main_text'],
-                questions=row['questions'],
-                source=row['source']
-            )
-            
-            # Générer la réponse
-            start_time = time.time()
-            output_text = generate_response(model, tokenizer, prompt, inference_config)
-            generation_time = time.time() - start_time
-            
-            # Enregistrer la réponse
-            df.at[i, 'model_response'] = output_text
-            df.at[i, 'generation_time'] = generation_time
-            
-            # Afficher la progression
-            logger.info(f"Traité {i+1}/{len(df)} - Temps: {generation_time:.2f}s")
-            
-        except Exception as e:
-            logger.error(f"Erreur lors du traitement de la ligne {i}: {e}")
-            df.at[i, 'model_response'] = f"ERREUR: {str(e)}"
-    
-    # Calculer le temps total
-    total_time = time.time() - total_start_time
-    logger.info(f"Traitement terminé en {total_time:.2f} secondes")
-    logger.info(f"Temps moyen par exemple: {total_time/len(df):.2f} secondes")
-    
-    # Sauvegarder les résultats
-    if output_file is None:
-        # Créer un nom de fichier par défaut
-        input_path = Path(input_file)
-        output_file = str(input_path.parent / f"{input_path.stem}_results{input_path.suffix}")
-    
-    df.to_csv(output_file, index=False)
-    logger.info(f"Résultats sauvegardés dans {output_file}")
-    
-    return df
-
 def main():
     """Fonction principale"""
-    parser = argparse.ArgumentParser(description="Inférence avec un modèle comptable fine-tuné")
-    parser.add_argument("--model_path", type=str, default="hf_model_export", 
-                        help="Chemin vers le modèle sauvegardé")
-    parser.add_argument("--mode", type=str, choices=["interactive", "batch"], default="interactive",
-                        help="Mode d'inférence: interactif ou par lot")
-    parser.add_argument("--input_file", type=str, 
-                        help="Fichier CSV d'entrée pour le mode batch")
-    parser.add_argument("--output_file", type=str, 
-                        help="Fichier CSV de sortie pour le mode batch")
+    parser = argparse.ArgumentParser(description="Inférence avec un modèle Wan2.1 fine-tuné")
+    parser.add_argument("--model_path", type=str, default="/workspace/full_model", 
+                        help="Chemin vers le modèle sauvegardé (par défaut: modèle complet)")
+    parser.add_argument("--use_lora_only", action="store_true",
+                        help="Utiliser uniquement les poids LoRA (hf_model_export) au lieu du modèle complet")
     parser.add_argument("--max_seq_length", type=int, default=2048,
                         help="Longueur maximale de séquence")
     parser.add_argument("--load_in_4bit", action="store_true", default=True,
@@ -359,32 +370,26 @@ def main():
     
     args = parser.parse_args()
     
+    # Déterminer le chemin du modèle
+    model_path = args.model_path
+    if args.use_lora_only:
+        model_path = "hf_model_export"
+        logger.info(f"Utilisation des poids LoRA uniquement depuis {model_path}")
+    
     # Déterminer le périphérique
     device = "cpu" if args.cpu else None
     
     try:
         # Initialiser le modèle
         model, tokenizer, inference_config = initialize_model(
-            args.model_path, 
+            model_path, 
             args.max_seq_length,
             args.load_in_4bit,
             device
         )
         
-        # Exécuter le mode approprié
-        if args.mode == "interactive":
-            interactive_evaluation(model, tokenizer, inference_config)
-        else:  # batch
-            if not args.input_file:
-                parser.error("--input_file est requis pour le mode batch")
-            
-            batch_evaluation_from_file(
-                model, 
-                tokenizer, 
-                args.input_file, 
-                args.output_file,
-                inference_config
-            )
+        # Exécuter le mode interactif
+        interactive_evaluation(model, tokenizer, inference_config)
         
     except Exception as e:
         logger.error(f"Erreur: {e}")
