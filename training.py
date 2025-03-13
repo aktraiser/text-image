@@ -9,6 +9,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi, snapshot_download
 import sys
 import subprocess
+import importlib.util
 
 # Configuration du logger pour suivre l'exécution
 logging.basicConfig(level=logging.INFO)
@@ -21,14 +22,24 @@ def clone_wan_repository():
     """Clone the Wan2.1 repository to access the model code."""
     logger.info("Cloning the Wan2.1 repository...")
     
-    if not os.path.exists("Wan2.1"):
-        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git"], check=True)
+    if not os.path.exists("Wan2_1"):  # Changed directory name to avoid the dot
+        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git", "Wan2_1"], check=True)
         logger.info("Repository cloned successfully.")
     else:
         logger.info("Repository already exists, skipping clone.")
     
     # Add the repository to Python path to import modules
-    sys.path.append(os.path.abspath("Wan2.1"))
+    sys.path.append(os.path.abspath("Wan2_1"))
+
+def load_module_from_file(file_path, module_name):
+    """Load a Python module from a file path."""
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None:
+        return None
+    
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def download_model_weights(model_name="Wan-AI/Wan2.1-T2V-14B", local_dir="./Wan2.1-T2V-14B"):
     """Download the model weights from Hugging Face."""
@@ -57,19 +68,25 @@ def load_model_and_tokenizer():
     
     # Import the custom modules from the cloned repository
     try:
-        from Wan2.1.generate import load_t2v_pipeline
+        # Try to load the generate.py module directly using importlib
+        generate_module = load_module_from_file(os.path.join("Wan2_1", "generate.py"), "generate")
         
-        # Load the model using the custom function
-        model = load_t2v_pipeline(
-            task="t2v-14B",
-            ckpt_dir=model_dir,
-            size="1280*720",  # Default resolution
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-        )
-    except ImportError:
-        # Fallback to using the generate.py script directly
-        logger.info("Using fallback method to load the model...")
+        if generate_module and hasattr(generate_module, "load_t2v_pipeline"):
+            # Load the model using the custom function
+            model = generate_module.load_t2v_pipeline(
+                task="t2v-14B",
+                ckpt_dir=model_dir,
+                size="1280*720",  # Default resolution
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            logger.info("Successfully loaded model using custom pipeline")
+        else:
+            raise ImportError("Could not find load_t2v_pipeline function")
+            
+    except (ImportError, FileNotFoundError) as e:
+        # Fallback to using a direct approach
+        logger.info(f"Using fallback method to load the model: {str(e)}")
         
         # Create a simple wrapper around the model
         class WanModelWrapper:
@@ -78,8 +95,24 @@ def load_model_and_tokenizer():
                 self.unet = None  # Will be populated later
                 self.tokenizer = None
                 
+                # Try to load the UNet component directly
+                try:
+                    from diffusers import UNet2DConditionModel
+                    self.unet = UNet2DConditionModel.from_pretrained(
+                        os.path.join(model_dir, "unet"),
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                    )
+                    logger.info("Successfully loaded UNet component")
+                except Exception as unet_error:
+                    logger.warning(f"Could not load UNet: {str(unet_error)}")
+                
                 # Load the tokenizer
-                self.tokenizer = AutoTokenizer.from_pretrained("t5-base")  # Default tokenizer, will be replaced
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+                    logger.info("Successfully loaded tokenizer")
+                except Exception:
+                    logger.warning("Could not load tokenizer, using t5-base instead")
+                    self.tokenizer = AutoTokenizer.from_pretrained("t5-base")
         
         model = WanModelWrapper(model_dir)
     
@@ -93,8 +126,12 @@ def load_model_and_tokenizer():
     )
     
     # Extract the UNet from the pipeline if it's a DiffusionPipeline
-    if hasattr(model, "unet"):
-        model.unet = get_peft_model(model.unet, lora_config)
+    if hasattr(model, "unet") and model.unet is not None:
+        try:
+            model.unet = get_peft_model(model.unet, lora_config)
+            logger.info("Successfully applied LoRA to UNet")
+        except Exception as lora_error:
+            logger.error(f"Failed to apply LoRA: {str(lora_error)}")
     else:
         logger.warning("Could not apply LoRA to UNet - model structure is different than expected")
     
@@ -102,6 +139,7 @@ def load_model_and_tokenizer():
     tokenizer = getattr(model, "tokenizer", None)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained("t5-base")
+        logger.info("Using t5-base tokenizer as fallback")
     
     return model, tokenizer
 
