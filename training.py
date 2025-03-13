@@ -193,11 +193,14 @@ def prepare_dataset(tokenizer, data_path="dataset"):
 
 def setup_trainer(model, tokenizer, dataset):
     """Configure l'entraîneur avec les hyperparamètres d'entraînement."""
+    # Set up wandb if needed
+    os.environ["WANDB_PROJECT"] = "wan_finetune"  # Set project name via environment variable
+    
     training_args = TrainingArguments(
         output_dir="./outputs",          # Dossier de sortie
         per_device_train_batch_size=1,   # Taille du batch par appareil
         num_train_epochs=1,              # Nombre d'époques
-        max_steps=2000,                  # Nombre total de pas
+        max_steps=10,                  # Nombre total de pas
         learning_rate=0.0001,            # Taux d'apprentissage
         optim="adamw_8bit",              # Optimiseur adapté
         logging_steps=250,               # Intervalle de logs
@@ -205,7 +208,6 @@ def setup_trainer(model, tokenizer, dataset):
         gradient_checkpointing=False,    # Pas de checkpointing
         fp16=torch.cuda.is_available(),  # Utiliser FP16 si GPU disponible
         report_to="wandb",               # Suivi avec Weights & Biases
-        wandb_project="wan_finetune",    # Nom du projet W&B
         logging_dir="./logs",            # Dossier des logs
         save_strategy="steps",           # Sauvegarde par étapes
         save_total_limit=3,              # Limite de sauvegardes
