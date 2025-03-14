@@ -5,19 +5,12 @@ MODE="train"
 PROMPT=""
 OUTPUT_DIR="./generated_outputs"
 SIZE="832*480"
-VIDEO_MODE=false
-NUM_FRAMES=24
-FPS=8
 
 # Traiter les arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
     --inference)
       MODE="inference"
-      shift
-      ;;
-    --video)
-      VIDEO_MODE=true
       shift
       ;;
     --prompt)
@@ -30,14 +23,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --size)
       SIZE="$2"
-      shift 2
-      ;;
-    --num_frames)
-      NUM_FRAMES="$2"
-      shift 2
-      ;;
-    --fps)
-      FPS="$2"
       shift 2
       ;;
     *)
@@ -74,7 +59,6 @@ if [ "$MODE" = "train" ]; then
   
   echo "Entraînement terminé. Les poids LoRA sont disponibles dans le dossier hf_model_export."
   echo "Pour générer des images, utilisez: ./training.sh --inference --prompt \"votre prompt ici\""
-  echo "Pour générer des vidéos, utilisez: ./training.sh --inference --video --prompt \"votre prompt ici\""
 
 # Mode inférence
 else
@@ -83,7 +67,7 @@ else
   # Vérifier si un prompt a été fourni
   if [ -z "$PROMPT" ]; then
     echo "ERREUR: Aucun prompt fourni pour l'inférence."
-    echo "Usage: ./training.sh --inference [--video] --prompt \"votre prompt ici\" [--output_dir dossier] [--size largeur*hauteur]"
+    echo "Usage: ./training.sh --inference --prompt \"votre prompt ici\" [--output_dir dossier] [--size largeur*hauteur]"
     exit 1
   fi
   
@@ -109,36 +93,10 @@ else
     exit 1
   fi
   
-  # Mode vidéo ou image
-  if [ "$VIDEO_MODE" = true ]; then
-    echo "=== Lancement de l'inférence vidéo avec LoRA ==="
-    
-    # Vérifier si video_inference.py existe
-    if [ ! -f "video_inference.py" ]; then
-      echo "ERREUR: Le fichier video_inference.py n'existe pas."
-      echo "Veuillez créer ce fichier avant de continuer."
-      exit 1
-    fi
-    
-    # Exécuter le script d'inférence vidéo
-    echo "Génération de vidéo avec le prompt: $PROMPT"
-    python video_inference.py \
-      --prompt "$PROMPT" \
-      --use_lora_only \
-      --model_path "./hf_model_export" \
-      --output_dir "$OUTPUT_DIR" \
-      --size "$SIZE" \
-      --num_frames "$NUM_FRAMES" \
-      --fps "$FPS" \
-      --num_inference_steps 50 \
-      --guidance_scale 7.5
-    
-    echo "Inférence vidéo terminée. Vérifiez le dossier $OUTPUT_DIR pour les résultats."
-  else
-    echo "=== Lancement de l'inférence image avec LoRA ==="
-    
-    # Créer un script Python temporaire pour l'inférence
-    cat > temp_inference.py << 'EOF'
+  echo "=== Lancement de l'inférence avec LoRA ==="
+  
+  # Créer un script Python temporaire pour l'inférence
+  cat > temp_inference.py << 'EOF'
 import torch
 from diffusers import StableDiffusionPipeline
 from peft import PeftModel
@@ -243,18 +201,17 @@ if __name__ == "__main__":
     main()
 EOF
   
-    # Exécuter le script d'inférence
-    echo "Génération d'image avec le prompt: $PROMPT"
-    python temp_inference.py \
-      --prompt "$PROMPT" \
-      --output_dir "$OUTPUT_DIR" \
-      --size "$SIZE" \
-      --num_inference_steps 50 \
-      --guidance_scale 7.5
-    
-    # Supprimer le script temporaire
-    rm temp_inference.py
-    
-    echo "Inférence image terminée. Vérifiez le dossier $OUTPUT_DIR pour les résultats."
-  fi
+  # Exécuter le script d'inférence
+  echo "Génération d'image avec le prompt: $PROMPT"
+  python temp_inference.py \
+    --prompt "$PROMPT" \
+    --output_dir "$OUTPUT_DIR" \
+    --size "$SIZE" \
+    --num_inference_steps 50 \
+    --guidance_scale 7.5
+  
+  # Supprimer le script temporaire
+  rm temp_inference.py
+  
+  echo "Inférence terminée. Vérifiez le dossier $OUTPUT_DIR pour les résultats."
 fi
