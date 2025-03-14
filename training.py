@@ -12,7 +12,7 @@ import wandb
 import numpy as np
 import random
 
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTokenizer, CLIPTextModel, TrainingArguments
 from peft import LoraConfig, get_peft_model
 from diffusers import UNet2DConditionModel, AutoencoderKL, StableDiffusionPipeline
 from trl import SFTTrainer
