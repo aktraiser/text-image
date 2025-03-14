@@ -224,9 +224,12 @@ def prepare_dataset(tokenizer, data_path="dataset"):
         logger.warning(f"Le répertoire {data_path} n'existait pas et a été créé. Veuillez y ajouter vos données.")
         return None
     
-    # Prétraitement standard pour les modèles de diffusion
+    # Prétraitement standard pour les modèles de diffusion avec augmentation de données
     preprocess = transforms.Compose([
         transforms.Resize((512, 512)),
+        transforms.RandomHorizontalFlip(p=0.5),  # Flip horizontal aléatoire
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),  # Variation de couleur
+        transforms.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),  # Légère rotation/translation/échelle
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
@@ -262,11 +265,18 @@ def prepare_dataset(tokenizer, data_path="dataset"):
         "text": [item["text"] for item in image_text_pairs]
     })
     
-    # Fonction de prétraitement pour chaque exemple
+    # Fonction de prétraitement pour chaque exemple avec caption dropout
+    caption_dropout_rate = 0.05  # Taux de dropout des légendes, comme dans Replicate
+    
     def load_and_preprocess(example):
         try:
             image = Image.open(example["image_path"]).convert("RGB")
             example["image"] = preprocess(image)
+            
+            # Appliquer le caption dropout (remplacer par une chaîne vide avec une probabilité de caption_dropout_rate)
+            if random.random() < caption_dropout_rate:
+                example["text"] = ""
+                logger.debug(f"Caption dropout appliqué pour {example['image_path']}")
             
             # Tokenisation du texte avec attention_mask
             tokenized = tokenizer(
@@ -349,12 +359,12 @@ def setup_trainer(model, tokenizer, dataset):
         output_dir="./outputs",
         per_device_train_batch_size=1,  # Taille de batch réduite pour éviter les OOM
         gradient_accumulation_steps=4,  # Accumulation de gradient pour simuler un batch plus grand
-        num_train_epochs=100,  # Augmenté de 1 à 100 pour un meilleur apprentissage
-        max_steps=500,  # Augmenté de 10 à 500 pour un apprentissage plus approfondi
+        num_train_epochs=1,
+        max_steps=1000,
         learning_rate=1e-4,
         optim="adamw_8bit",  # Optimiseur 8-bit pour réduire l'utilisation mémoire
-        logging_steps=10,  # Augmenté pour réduire la verbosité des logs
-        save_steps=50,  # Augmenté pour sauvegarder moins fréquemment
+        logging_steps=50,  # Augmenté pour réduire la verbosité des logs
+        save_steps=100,  # Augmenté pour sauvegarder moins fréquemment
         gradient_checkpointing=True,  # Activer le gradient checkpointing pour économiser la mémoire
         fp16=torch.cuda.is_available(),
         report_to="wandb",
@@ -797,11 +807,11 @@ def main():
             per_device_train_batch_size=gpu_recommendations["batch_size"] if gpu_recommendations else 1,
             gradient_accumulation_steps=gpu_recommendations["gradient_accumulation_steps"] if gpu_recommendations else 4,
             num_train_epochs=1,
-            max_steps=500,
+            max_steps=1000,
             learning_rate=1e-4,
             optim=optim_choice,
-            logging_steps=1,
-            save_steps=5,
+            logging_steps=50,
+            save_steps=100,
             gradient_checkpointing=gpu_recommendations["gradient_checkpointing"] if gpu_recommendations else True,
             fp16=gpu_recommendations["fp16"] if gpu_recommendations else False,  # Désactivé par défaut pour éviter les conflits
             report_to="wandb",
