@@ -254,12 +254,19 @@ def prepare_dataset(tokenizer, data_path="dataset"):
         try:
             image = Image.open(example["image_path"]).convert("RGB")
             example["image"] = preprocess(image)
-            # Tokenisation du texte
-            example["input_ids"] = tokenizer(example["text"], 
-                                            padding="max_length", 
-                                            truncation=True, 
-                                            max_length=77, 
-                                            return_tensors="pt").input_ids[0]
+            
+            # Tokenisation du texte avec attention_mask
+            tokenized = tokenizer(
+                example["text"], 
+                padding="max_length", 
+                truncation=True, 
+                max_length=77, 
+                return_tensors="pt"
+            )
+            
+            example["input_ids"] = tokenized.input_ids[0]
+            example["attention_mask"] = tokenized.attention_mask[0]
+            
             return example
         except Exception as e:
             logger.error(f"Erreur lors du prétraitement de {example['image_path']}: {e}")
@@ -281,6 +288,11 @@ def data_collator(examples, tokenizer):
     if all("input_ids" in example for example in examples):
         input_ids = torch.stack([example["input_ids"] for example in examples])
         batch["input_ids"] = input_ids
+    
+    # Collecter les attention_mask
+    if all("attention_mask" in example for example in examples):
+        attention_mask = torch.stack([example["attention_mask"] for example in examples])
+        batch["attention_mask"] = attention_mask
     
     # Collecter les images
     if all("image" in example for example in examples):
@@ -489,12 +501,18 @@ def main():
             dataloader_pin_memory=True,
         )
         
+        # Utiliser un SFTTrainer personnalisé pour éviter les problèmes avec le format du dataset
+        from trl import SFTTrainer
+        
+        # Désactiver la conversion en format ChatML qui cause des problèmes
         trainer = SFTTrainer(
             model=model.unet,
             args=training_args,
             train_dataset=dataset,
             tokenizer=tokenizer,
-            data_collator=lambda examples: data_collator(examples, tokenizer)
+            data_collator=lambda examples: data_collator(examples, tokenizer),
+            dataset_text_field=None,  # Désactive la conversion en format ChatML
+            packing=False,  # Désactive le packing qui nécessite un format spécifique
         )
         
         logger.info(f"Trainer configuré avec batch_size={training_args.per_device_train_batch_size}, "
