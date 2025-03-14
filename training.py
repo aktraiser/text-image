@@ -487,7 +487,9 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
         )
         
         # Boucle principale d'entraînement
-        for epoch in range(int(training_args.num_train_epochs)):
+        epoch = 0
+        while global_step < training_args.max_steps:
+            logger.info(f"Début de l'époque {epoch+1}")
             model.unet.train()
             model.text_encoder.train()
             
@@ -593,6 +595,8 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
                     import traceback
                     logger.error(traceback.format_exc())
                     continue
+            
+            epoch += 1
         
         # Sauvegarde finale
         final_save_path = os.path.join(training_args.output_dir, "final")
