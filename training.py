@@ -267,7 +267,11 @@ def setup_trainer(model, tokenizer, dataset):
         # If we can't find a specific component, try using a dummy model for testing
         from transformers import AutoModelForCausalLM
         logger.info("Creating a dummy model for testing")
-        train_model = AutoModelForCausalLM.from_pretrained("gpt2-medium", device_map="auto")
+        # Avoid using device_map="auto" which requires a newer version of Accelerate
+        train_model = AutoModelForCausalLM.from_pretrained("gpt2-medium")
+        # Move model to GPU if available
+        if torch.cuda.is_available():
+            train_model = train_model.to("cuda")
     
     training_args = TrainingArguments(
         output_dir="./outputs",          # Dossier de sortie
