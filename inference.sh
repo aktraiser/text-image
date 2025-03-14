@@ -29,9 +29,12 @@ pip install av
 mkdir -p "$OUTPUT_DIR"
 
 # Préparer les arguments pour inference.py
-ARGS="--prompt \"$PROMPT\" --output_dir \"$OUTPUT_DIR\" --size \"$SIZE\""
+ARGS=""
 
-# Si use_lora_only est true, utiliser les poids LoRA
+# Ajouter le prompt
+ARGS="$ARGS --prompt \"$PROMPT\""
+
+# Ajouter le chemin du modèle
 if [ "$USE_LORA_ONLY" = "true" ]; then
     echo "Utilisation des poids LoRA uniquement..."
     ARGS="$ARGS --use_lora_only"
@@ -42,6 +45,12 @@ if [ "$USE_LORA_ONLY" = "true" ]; then
 fi
 
 ARGS="$ARGS --model_path \"$MODEL_PATH\""
+
+# Ajouter le dossier de sortie et la taille
+ARGS="$ARGS --output_dir \"$OUTPUT_DIR\" --size \"$SIZE\""
+
+# Ajouter des paramètres supplémentaires pour les modèles de diffusion
+ARGS="$ARGS --num_inference_steps 50 --guidance_scale 7.5"
 
 # Vérifier que le chemin du modèle existe
 if [ ! -d "$MODEL_PATH" ]; then
