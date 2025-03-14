@@ -11,6 +11,7 @@ from torchvision import transforms
 import wandb
 import numpy as np
 import random
+import json
 
 from transformers import CLIPTokenizer, CLIPTextModel, TrainingArguments
 from peft import LoraConfig, get_peft_model
@@ -617,7 +618,7 @@ def check_disk_space(required_space_gb=10):
         raise RuntimeError(f"Espace disque insuffisant : {free_gb:.2f} GB disponibles, {required_space_gb} GB requis.")
 
 def export_model(model, tokenizer, export_dir="hf_model_export"):
-    """Exporte les adaptateurs LoRA et le tokenizer."""
+    """Exporte les adaptateurs LoRA et le tokenizer au format attendu par diffusers."""
     check_disk_space(required_space_gb=5)
     os.makedirs(export_dir, exist_ok=True)
     abs_export_dir = os.path.abspath(export_dir)
@@ -629,7 +630,7 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
     os.makedirs(unet_lora_dir, exist_ok=True)
     os.makedirs(text_encoder_lora_dir, exist_ok=True)
     
-    # Sauvegarder les adaptateurs LoRA
+    # Sauvegarder les adaptateurs LoRA dans le format original
     if hasattr(model, "unet"):
         logger.info("Sauvegarde de l'adaptateur LoRA pour l'UNet...")
         model.unet.save_pretrained(unet_lora_dir)
@@ -643,7 +644,7 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
         logger.info("Sauvegarde du tokenizer...")
         tokenizer.save_pretrained(export_dir)
     
-    # Créer un README détaillé
+    # Créer un README détaillé pour le format original
     with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
         f.write("# Adaptateurs LoRA pour Stable Diffusion\n\n")
         f.write("Ce dépôt contient des adaptateurs LoRA pour fine-tuner Stable Diffusion 2.1.\n\n")
@@ -684,7 +685,205 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
         f.write("- Modules cibles Text Encoder: q_proj, k_proj, v_proj\n")
         f.write("- Dropout: 0.05\n")
     
-    logger.info(f"Adaptateurs LoRA et tokenizer exportés avec succès dans {abs_export_dir}")
+    # Maintenant, créer une version compatible avec diffusers
+    diffusers_export_dir = os.path.join(export_dir, "diffusers_format")
+    os.makedirs(diffusers_export_dir, exist_ok=True)
+    
+    logger.info(f"Conversion des poids LoRA au format attendu par diffusers dans {diffusers_export_dir}...")
+    
+    # Créer les dossiers de sortie pour diffusers
+    unet_output_dir = os.path.join(diffusers_export_dir, "unet")
+    text_encoder_output_dir = os.path.join(diffusers_export_dir, "text_encoder")
+    os.makedirs(unet_output_dir, exist_ok=True)
+    os.makedirs(text_encoder_output_dir, exist_ok=True)
+    
+    # Convertir les poids de l'UNet
+    logger.info("Conversion des poids LoRA de l'UNet...")
+    unet_adapter_model = os.path.join(unet_lora_dir, "adapter_model.safetensors")
+    unet_adapter_config = os.path.join(unet_lora_dir, "adapter_config.json")
+    
+    if os.path.exists(unet_adapter_model) and os.path.exists(unet_adapter_config):
+        # Copier le fichier de poids avec le nouveau nom
+        shutil.copy(
+            unet_adapter_model,
+            os.path.join(unet_output_dir, "pytorch_lora_weights.safetensors")
+        )
+        
+        # Lire et adapter la configuration
+        with open(unet_adapter_config, "r") as f:
+            config = json.load(f)
+        
+        # Écrire la configuration adaptée
+        with open(os.path.join(unet_output_dir, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+        
+        logger.info(f"Poids LoRA de l'UNet convertis avec succès")
+    else:
+        logger.error(f"Fichiers adapter_model.safetensors ou adapter_config.json manquants pour l'UNet")
+    
+    # Convertir les poids de l'encodeur de texte
+    logger.info("Conversion des poids LoRA de l'encodeur de texte...")
+    text_encoder_adapter_model = os.path.join(text_encoder_lora_dir, "adapter_model.safetensors")
+    text_encoder_adapter_config = os.path.join(text_encoder_lora_dir, "adapter_config.json")
+    
+    if os.path.exists(text_encoder_adapter_model) and os.path.exists(text_encoder_adapter_config):
+        # Copier le fichier de poids avec le nouveau nom
+        shutil.copy(
+            text_encoder_adapter_model,
+            os.path.join(text_encoder_output_dir, "pytorch_lora_weights.safetensors")
+        )
+        
+        # Lire et adapter la configuration
+        with open(text_encoder_adapter_config, "r") as f:
+            config = json.load(f)
+        
+        # Écrire la configuration adaptée
+        with open(os.path.join(text_encoder_output_dir, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+        
+        logger.info(f"Poids LoRA de l'encodeur de texte convertis avec succès")
+    else:
+        logger.error(f"Fichiers adapter_model.safetensors ou adapter_config.json manquants pour l'encodeur de texte")
+    
+    # Copier les fichiers du tokenizer
+    logger.info("Copie des fichiers du tokenizer...")
+    tokenizer_files = [
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer_config.json"
+    ]
+    
+    for file in tokenizer_files:
+        src_file = os.path.join(export_dir, file)
+        if os.path.exists(src_file):
+            shutil.copy(src_file, os.path.join(diffusers_export_dir, file))
+    
+    # Créer un fichier model_index.json
+    model_index = {
+        "format": "diffusers",
+        "_class_name": "StableDiffusionPipeline",
+        "_diffusers_version": "0.32.2",
+        "components": [
+            "text_encoder",
+            "unet"
+        ],
+        "model_type": "stable-diffusion-lora"
+    }
+    
+    with open(os.path.join(diffusers_export_dir, "model_index.json"), "w") as f:
+        json.dump(model_index, f, indent=2)
+    
+    # Créer un README pour le format diffusers
+    with open(os.path.join(diffusers_export_dir, "README.md"), "w") as f:
+        f.write("# LoRA Weights for Stable Diffusion (Diffusers Format)\n\n")
+        f.write("These weights were converted to the format expected by the diffusers library.\n\n")
+        f.write("## Usage with Diffusers\n\n")
+        f.write("```python\n")
+        f.write("from diffusers import StableDiffusionPipeline\n")
+        f.write("import torch\n\n")
+        f.write("# Load base model\n")
+        f.write("model_id = 'runwayml/stable-diffusion-v1-5'\n")
+        f.write("pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)\n\n")
+        f.write("# Load LoRA weights\n")
+        f.write("pipe.unet.load_attn_procs('path/to/diffusers_format/unet')\n")
+        f.write("pipe.text_encoder.load_attn_procs('path/to/diffusers_format/text_encoder')\n\n")
+        f.write("# Move to GPU\n")
+        f.write("pipe = pipe.to('cuda')\n\n")
+        f.write("# Generate image\n")
+        f.write("prompt = 'Your prompt here'\n")
+        f.write("image = pipe(prompt=prompt).images[0]\n")
+        f.write("image.save('output.png')\n")
+        f.write("```\n")
+    
+    # Mettre à jour le script d'inférence pour utiliser le format diffusers
+    inference_script = """#!/bin/bash
+
+# Vérifier si un prompt a été fourni
+if [ "$#" -lt 1 ]; then
+    echo "Usage: ./inference.sh \"votre prompt ici\" [model_path] [output_dir] [size] [use_lora_only]"
+    echo "  - model_path: Chemin vers le modèle (défaut: ./hf_model_export/diffusers_format)"
+    echo "  - output_dir: Dossier de sortie (défaut: ./generated_outputs)"
+    echo "  - size: Taille de l'image (défaut: 832*480)"
+    echo "  - use_lora_only: Utiliser uniquement les poids LoRA (true/false, défaut: true)"
+    exit 1
+fi
+
+PROMPT="$1"
+MODEL_PATH="${2:-./hf_model_export/diffusers_format}"
+OUTPUT_DIR="${3:-./generated_outputs}"
+SIZE="${4:-832*480}"
+USE_LORA_ONLY="${5:-true}"
+
+# Installer les dépendances nécessaires
+echo "Installation des dépendances..."
+pip install torch torchvision torchaudio
+pip install diffusers transformers accelerate
+pip install safetensors
+pip install easydict einops decord opencv-python timm omegaconf imageio imageio-ffmpeg
+pip install ftfy regex tqdm matplotlib scikit-image lpips kornia
+pip install av
+
+# Créer le répertoire de sortie s'il n'existe pas
+mkdir -p "$OUTPUT_DIR"
+
+# Préparer les arguments pour inference.py
+ARGS=""
+
+# Ajouter le prompt
+ARGS="$ARGS --prompt \\"$PROMPT\\""
+
+# Ajouter le chemin du modèle
+if [ "$USE_LORA_ONLY" = "true" ]; then
+    echo "Utilisation des poids LoRA uniquement..."
+    ARGS="$ARGS --use_lora_only"
+    # Si le chemin du modèle n'est pas spécifié, utiliser hf_model_export/diffusers_format
+    if [ "$2" = "" ]; then
+        MODEL_PATH="./hf_model_export/diffusers_format"
+    fi
+fi
+
+ARGS="$ARGS --model_path \\"$MODEL_PATH\\""
+
+# Ajouter le dossier de sortie et la taille
+ARGS="$ARGS --output_dir \\"$OUTPUT_DIR\\" --size \\"$SIZE\\""
+
+# Ajouter des paramètres supplémentaires pour les modèles de diffusion
+ARGS="$ARGS --num_inference_steps 50 --guidance_scale 7.5"
+
+# Vérifier que le chemin du modèle existe
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "ERREUR: Le chemin du modèle '$MODEL_PATH' n'existe pas."
+    echo "Veuillez spécifier un chemin valide ou créer le répertoire."
+    exit 1
+fi
+
+# Afficher les paramètres pour le débogage
+echo "Paramètres d'inférence:"
+echo "- Prompt: $PROMPT"
+echo "- Chemin du modèle: $MODEL_PATH"
+echo "- Dossier de sortie: $OUTPUT_DIR"
+echo "- Taille: $SIZE"
+echo "- Utiliser LoRA uniquement: $USE_LORA_ONLY"
+
+# Exécuter l'inférence
+echo "Lancement de l'inférence..."
+eval "python inference.py $ARGS"
+
+echo "Inférence terminée. Vérifiez le dossier $OUTPUT_DIR pour les résultats."
+"""
+    
+    # Écrire le script d'inférence mis à jour
+    with open(os.path.join(export_dir, "inference.sh"), "w") as f:
+        f.write(inference_script)
+    
+    # Rendre le script exécutable
+    os.chmod(os.path.join(export_dir, "inference.sh"), 0o755)
+    
+    logger.info(f"Adaptateurs LoRA exportés avec succès dans {abs_export_dir}")
+    logger.info(f"Version compatible avec diffusers disponible dans {os.path.join(abs_export_dir, 'diffusers_format')}")
+    logger.info(f"Script d'inférence mis à jour dans {os.path.join(abs_export_dir, 'inference.sh')}")
+    
     return abs_export_dir
 
 def upload_to_hf(export_dir, repo_id):
