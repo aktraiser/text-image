@@ -77,7 +77,7 @@ else
   # Créer le répertoire de sortie s'il n'existe pas
   mkdir -p "$OUTPUT_DIR"
   
-  echo "=== Conversion des poids LoRA au format diffusers ==="
+  echo "=== Vérification des poids LoRA ==="
   
   # Vérifier si le dossier hf_model_export existe
   if [ ! -d "./hf_model_export" ]; then
@@ -86,39 +86,121 @@ else
     exit 1
   fi
   
-  # Vérifier si le dossier diffusers_format existe déjà
-  if [ ! -d "./hf_model_export/diffusers_format" ]; then
-    echo "Conversion des poids LoRA au format diffusers..."
-    
-    # Exécuter le script de conversion intégré dans training.py
-    python -c "
-import sys
-sys.path.append('.')
-from training import export_model
-export_model(None, None, 'hf_model_export')
-"
-    
-    if [ $? -ne 0 ]; then
-      echo "ERREUR: La conversion des poids LoRA a échoué."
-      exit 1
-    fi
-    
-    echo "Conversion terminée avec succès."
-  else
-    echo "Les poids LoRA sont déjà au format diffusers."
+  # Vérifier si les dossiers LoRA existent
+  if [ ! -d "./hf_model_export/unet_lora" ] || [ ! -d "./hf_model_export/text_encoder_lora" ]; then
+    echo "ERREUR: Les dossiers de poids LoRA sont manquants."
+    echo "Veuillez exécuter le script en mode entraînement d'abord: ./training.sh"
+    exit 1
   fi
   
-  echo "=== Lancement de l'inférence ==="
+  echo "=== Lancement de l'inférence avec LoRA ==="
   
-  # Exécuter l'inférence avec les poids LoRA convertis
+  # Créer un script Python temporaire pour l'inférence
+  cat > temp_inference.py << 'EOF'
+import torch
+from diffusers import StableDiffusionPipeline
+from PIL import Image
+import argparse
+import os
+import time
+
+def parse_size(size_str):
+    try:
+        width, height = map(int, size_str.split('*'))
+        return width, height
+    except:
+        print(f"Format de taille invalide: {size_str}, utilisation de la taille par défaut 512x512")
+        return 512, 512
+
+def main():
+    parser = argparse.ArgumentParser(description="Inférence avec LoRA pour Stable Diffusion")
+    parser.add_argument("--prompt", type=str, required=True, help="Prompt pour la génération d'image")
+    parser.add_argument("--output_dir", type=str, default="./generated_outputs", help="Dossier de sortie")
+    parser.add_argument("--size", type=str, default="512*512", help="Taille de l'image (largeur*hauteur)")
+    parser.add_argument("--num_inference_steps", type=int, default=50, help="Nombre d'étapes d'inférence")
+    parser.add_argument("--guidance_scale", type=float, default=7.5, help="Échelle de guidance")
+    
+    args = parser.parse_args()
+    
+    # Créer le dossier de sortie s'il n'existe pas
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Déterminer le type de données à utiliser
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_capability()[0] >= 8:  # Ampere+ (RTX 30xx, A100, etc.)
+            dtype = torch.bfloat16
+            print("Utilisation de bfloat16 sur GPU Ampere+")
+        else:  # Architectures plus anciennes
+            dtype = torch.float16
+            print("Utilisation de float16 sur GPU pré-Ampere")
+    else:
+        dtype = torch.float32
+        print("Utilisation de float32 sur CPU")
+    
+    # Charger le modèle de base
+    print("Chargement du modèle de base Stable Diffusion...")
+    base_model_id = "runwayml/stable-diffusion-v1-5"
+    pipe = StableDiffusionPipeline.from_pretrained(
+        base_model_id,
+        torch_dtype=dtype
+    )
+    
+    # Déplacer le modèle sur GPU si disponible
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = pipe.to(device)
+    
+    # Appliquer les adaptateurs LoRA
+    print("Application des adaptateurs LoRA...")
+    
+    # Appliquer l'adaptateur LoRA à l'UNet
+    if os.path.exists("./hf_model_export/unet_lora"):
+        print("Application de l'adaptateur LoRA à l'UNet...")
+        pipe.unet.load_attn_procs("./hf_model_export/unet_lora")
+    
+    # Appliquer l'adaptateur LoRA à l'encodeur de texte
+    if os.path.exists("./hf_model_export/text_encoder_lora"):
+        print("Application de l'adaptateur LoRA à l'encodeur de texte...")
+        pipe.text_encoder.load_attn_procs("./hf_model_export/text_encoder_lora")
+    
+    # Traiter la taille
+    width, height = parse_size(args.size)
+    print(f"Taille d'image: {width}x{height}")
+    
+    # Générer l'image
+    print(f"Génération d'image avec le prompt: {args.prompt}")
+    start_time = time.time()
+    
+    image = pipe(
+        prompt=args.prompt,
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        width=width,
+        height=height
+    ).images[0]
+    
+    # Sauvegarder l'image
+    timestamp = int(time.time())
+    output_file = os.path.join(args.output_dir, f"image_{timestamp}.png")
+    image.save(output_file)
+    
+    print(f"Image générée et sauvegardée dans {output_file}")
+    print(f"Temps de génération: {time.time() - start_time:.2f} secondes")
+
+if __name__ == "__main__":
+    main()
+EOF
+  
+  # Exécuter le script d'inférence
   echo "Génération d'image avec le prompt: $PROMPT"
-  python inference.py \
+  python temp_inference.py \
     --prompt "$PROMPT" \
-    --model_path "./hf_model_export/diffusers_format" \
     --output_dir "$OUTPUT_DIR" \
     --size "$SIZE" \
     --num_inference_steps 50 \
     --guidance_scale 7.5
+  
+  # Supprimer le script temporaire
+  rm temp_inference.py
   
   echo "Inférence terminée. Vérifiez le dossier $OUTPUT_DIR pour les résultats."
 fi
