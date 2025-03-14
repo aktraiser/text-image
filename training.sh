@@ -99,6 +99,7 @@ else
   cat > temp_inference.py << 'EOF'
 import torch
 from diffusers import StableDiffusionPipeline
+from peft import PeftModel
 from PIL import Image
 import argparse
 import os
@@ -149,18 +150,26 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = pipe.to(device)
     
-    # Appliquer les adaptateurs LoRA
-    print("Application des adaptateurs LoRA...")
+    # Appliquer les adaptateurs LoRA avec PEFT
+    print("Application des adaptateurs LoRA avec PEFT...")
     
     # Appliquer l'adaptateur LoRA à l'UNet
     if os.path.exists("./hf_model_export/unet_lora"):
         print("Application de l'adaptateur LoRA à l'UNet...")
-        pipe.unet.load_attn_procs("./hf_model_export/unet_lora")
+        pipe.unet = PeftModel.from_pretrained(
+            pipe.unet,
+            "./hf_model_export/unet_lora",
+            adapter_name="default"
+        )
     
     # Appliquer l'adaptateur LoRA à l'encodeur de texte
     if os.path.exists("./hf_model_export/text_encoder_lora"):
         print("Application de l'adaptateur LoRA à l'encodeur de texte...")
-        pipe.text_encoder.load_attn_procs("./hf_model_export/text_encoder_lora")
+        pipe.text_encoder = PeftModel.from_pretrained(
+            pipe.text_encoder,
+            "./hf_model_export/text_encoder_lora",
+            adapter_name="default"
+        )
     
     # Traiter la taille
     width, height = parse_size(args.size)
