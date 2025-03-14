@@ -123,12 +123,14 @@ def load_model_and_tokenizer(offload=False):
     """
     check_dependencies()
     
+    # Déterminer le type de données à utiliser
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     device = "cuda" if torch.cuda.is_available() and not offload else "cpu"
     
     try:
         logger.info("Chargement des composants de Stable Diffusion...")
         logger.info(f"Mode d'offloading: {'activé' if offload else 'désactivé'}")
+        logger.info(f"Type de données: {torch_dtype}")
         
         # Utiliser Stable Diffusion 2.1
         model_id = "stabilityai/stable-diffusion-2-1"
@@ -192,6 +194,12 @@ def load_model_and_tokenizer(offload=False):
             model.unet = model.unet.to("cuda")
             model.text_encoder = model.text_encoder.to("cuda")
             model.vae = model.vae.to("cuda")
+            
+            # S'assurer que tous les modèles sont du même type de données
+            logger.info(f"Conversion des modèles en {torch_dtype}...")
+            model.unet = model.unet.to(dtype=torch_dtype)
+            model.text_encoder = model.text_encoder.to(dtype=torch_dtype)
+            model.vae = model.vae.to(dtype=torch_dtype)
         
     except Exception as e:
         logger.error(f"Erreur lors du chargement du modèle : {e}")
@@ -268,10 +276,11 @@ def prepare_dataset(tokenizer, data_path="dataset"):
             example["input_ids"] = tokenized.input_ids[0]
             example["attention_mask"] = tokenized.attention_mask[0]
             
-            # S'assurer que les tenseurs sont sur CPU et détachés
+            # S'assurer que les tenseurs sont sur CPU, détachés et en float32
+            # Nous convertirons en float16 si nécessaire lors de l'entraînement
             example["input_ids"] = example["input_ids"].cpu().detach()
             example["attention_mask"] = example["attention_mask"].cpu().detach()
-            example["image"] = example["image"].cpu().detach()
+            example["image"] = example["image"].cpu().detach().float()  # Assurer que l'image est en float32
             
             return example
         except Exception as e:
@@ -417,6 +426,14 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
         model.text_encoder.to(device)
         model.vae.to(device)
         
+        # Déterminer le type de données à utiliser
+        weight_dtype = torch.float16 if training_args.fp16 else torch.float32
+        
+        # Convertir le VAE au même type de données que les entrées
+        # Si fp16 est activé, convertir le VAE en float16, sinon en float32
+        model.vae.to(dtype=weight_dtype)
+        logger.info(f"VAE converti en {weight_dtype}")
+        
         # Mettre le VAE en mode évaluation car nous ne l'entraînons pas
         model.vae.eval()
         
@@ -451,8 +468,8 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
                     if global_step >= training_args.max_steps:
                         break
                     
-                    # Déplacer les données sur le périphérique
-                    pixel_values = batch["pixel_values"].to(device)
+                    # Déplacer les données sur le périphérique et convertir au bon type
+                    pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch.get("attention_mask", None)
                     if attention_mask is not None:
@@ -460,6 +477,7 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
                     
                     # Convertir les images en latents
                     with torch.no_grad():
+                        # Utiliser le même type de données pour le VAE et les entrées
                         latents = model.vae.encode(pixel_values).latent_dist.sample() * 0.18215
                     
                     # Ajouter du bruit aux latents
