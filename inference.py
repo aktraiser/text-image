@@ -147,43 +147,61 @@ def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=
             logger.info("Chargement du modèle de base Stable Diffusion...")
             
             try:
-                # Charger le modèle de base (Stable Diffusion 1.5 par défaut)
-                base_model_id = "runwayml/stable-diffusion-v1-5"
+                # Charger le modèle de base (Stable Diffusion 2.1 au lieu de 1.5)
+                base_model_id = "stabilityai/stable-diffusion-2-1"
                 logger.info(f"Utilisation du modèle de base: {base_model_id}")
                 
-                # Charger le pipeline de base
+                # Utiliser le scheduler DDIM pour de meilleurs résultats
+                from diffusers import DDIMScheduler
+                scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+                
+                # Charger le pipeline de base avec le scheduler optimisé
                 pipe = StableDiffusionPipeline.from_pretrained(
                     base_model_id,
-                    torch_dtype=dtype
+                    torch_dtype=dtype,
+                    scheduler=scheduler,
+                    use_safetensors=True,
+                    variant="fp16" if torch.cuda.is_available() else None,
                 )
                 pipe = pipe.to(device)
                 
-                # Charger et appliquer les adaptateurs LoRA
-                logger.info("Application des adaptateurs LoRA...")
+                # Charger et appliquer les adaptateurs LoRA avec PEFT
+                logger.info("Application des adaptateurs LoRA avec PEFT...")
                 
                 # Charger les adaptateurs LoRA pour l'UNet
                 if os.path.exists(os.path.join(model_path, "unet_lora")):
-                    from diffusers import UNet2DConditionModel
+                    from peft import PeftModel
                     
-                    # Charger l'adaptateur LoRA pour l'UNet
+                    # Charger l'adaptateur LoRA pour l'UNet avec PEFT
                     unet_lora_path = os.path.join(model_path, "unet_lora")
                     logger.info(f"Chargement de l'adaptateur LoRA pour l'UNet depuis {unet_lora_path}")
                     
-                    # Appliquer l'adaptateur LoRA à l'UNet
-                    pipe.unet.load_attn_procs(unet_lora_path)
-                    logger.info("Adaptateur LoRA appliqué à l'UNet")
+                    # Appliquer l'adaptateur LoRA à l'UNet avec PEFT
+                    pipe.unet = PeftModel.from_pretrained(
+                        pipe.unet,
+                        unet_lora_path,
+                        adapter_name="default"
+                    )
+                    logger.info("Adaptateur LoRA appliqué à l'UNet avec PEFT")
                 
                 # Charger les adaptateurs LoRA pour l'encodeur de texte
                 if os.path.exists(os.path.join(model_path, "text_encoder_lora")):
-                    from diffusers import CLIPTextModel
+                    from peft import PeftModel
                     
-                    # Charger l'adaptateur LoRA pour l'encodeur de texte
+                    # Charger l'adaptateur LoRA pour l'encodeur de texte avec PEFT
                     text_encoder_lora_path = os.path.join(model_path, "text_encoder_lora")
                     logger.info(f"Chargement de l'adaptateur LoRA pour l'encodeur de texte depuis {text_encoder_lora_path}")
                     
-                    # Appliquer l'adaptateur LoRA à l'encodeur de texte
-                    pipe.text_encoder.load_attn_procs(text_encoder_lora_path)
-                    logger.info("Adaptateur LoRA appliqué à l'encodeur de texte")
+                    # Appliquer l'adaptateur LoRA à l'encodeur de texte avec PEFT
+                    pipe.text_encoder = PeftModel.from_pretrained(
+                        pipe.text_encoder,
+                        text_encoder_lora_path,
+                        adapter_name="default"
+                    )
+                    logger.info("Adaptateur LoRA appliqué à l'encodeur de texte avec PEFT")
+                
+                # Activer l'attention séquentielle pour économiser la mémoire
+                pipe.enable_attention_slicing()
                 
                 # Utiliser le tokenizer du pipeline
                 tokenizer = pipe.tokenizer
@@ -391,9 +409,9 @@ def main():
                         help="Dossier de sortie pour les images générées")
     parser.add_argument("--size", type=str, default="832*480",
                         help="Taille de l'image générée (format: largeur*hauteur)")
-    parser.add_argument("--num_inference_steps", type=int, default=50,
+    parser.add_argument("--num_inference_steps", type=int, default=75,
                         help="Nombre d'étapes d'inférence pour les modèles de diffusion")
-    parser.add_argument("--guidance_scale", type=float, default=7.5,
+    parser.add_argument("--guidance_scale", type=float, default=9.0,
                         help="Échelle de guidance pour les modèles de diffusion")
     
     args = parser.parse_args()
@@ -455,6 +473,7 @@ def main():
                     # Préparer les paramètres d'inférence
                     inference_params = {
                         "prompt": args.prompt,
+                        "negative_prompt": "low quality, bad anatomy, worst quality, low resolution, blurry, distorted",
                         "num_inference_steps": args.num_inference_steps,
                         "guidance_scale": args.guidance_scale,
                     }
@@ -464,17 +483,29 @@ def main():
                         inference_params["width"] = size[0]
                         inference_params["height"] = size[1]
                     
-                    # Générer l'image
-                    output = model(**inference_params)
+                    # Générer plusieurs images avec des graines différentes
+                    num_images = 4  # Générer 4 images et choisir la meilleure
+                    all_images = []
                     
-                    # Sauvegarder l'image
+                    for i in range(num_images):
+                        # Utiliser une graine différente pour chaque image
+                        seed = int(time.time()) + i
+                        generator = torch.Generator(device=device).manual_seed(seed)
+                        inference_params["generator"] = generator
+                        
+                        # Générer l'image
+                        output = model(**inference_params)
+                        all_images.append((output.images[0], seed))
+                    
+                    # Sauvegarder toutes les images
                     timestamp = int(time.time())
-                    output_file = os.path.join(args.output_dir, f"image_{timestamp}.png")
-                    output.images[0].save(output_file)
+                    for i, (image, seed) in enumerate(all_images):
+                        output_file = os.path.join(args.output_dir, f"image_{timestamp}_seed{seed}.png")
+                        image.save(output_file)
+                        logger.info(f"Image {i+1}/{num_images} générée et sauvegardée dans {output_file}")
                     
-                    logger.info(f"Image générée et sauvegardée dans {output_file}")
-                    print(f"Image générée et sauvegardée dans {output_file}")
-                    
+                    logger.info(f"{num_images} images générées et sauvegardées dans {args.output_dir}")
+                    print(f"{num_images} images générées et sauvegardées dans {args.output_dir}")
                 elif hasattr(model, 'generate') and callable(model.generate):
                     # Pour les modèles texte standard
                     response = generate_response(model, tokenizer, args.prompt, inference_config)
@@ -510,9 +541,10 @@ def main():
                         print("\nGénération de l'image...")
                         start_time = time.time()
                         
-                        # Générer l'image
+                        # Générer l'image avec des paramètres améliorés
                         output = model(
                             prompt=prompt,
+                            negative_prompt="low quality, bad anatomy, worst quality, low resolution, blurry, distorted",
                             num_inference_steps=args.num_inference_steps,
                             guidance_scale=args.guidance_scale
                         )
