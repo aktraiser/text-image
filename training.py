@@ -12,9 +12,9 @@ import wandb
 import numpy as np
 import random
 
-from transformers import AutoTokenizer, TrainingArguments, T5EncoderModel, CLIPVisionModel
+from transformers import CLIPTokenizer, CLIPTextModel
 from peft import LoraConfig, get_peft_model
-from diffusers import UNet2DConditionModel, AutoencoderKL, DiffusionPipeline
+from diffusers import UNet2DConditionModel, AutoencoderKL, StableDiffusionPipeline
 from trl import SFTTrainer
 from datasets import Dataset
 from huggingface_hub import HfApi, hf_hub_download
@@ -116,7 +116,7 @@ def check_dependencies():
             logger.info(f"{pkg} installé avec succès.")
 
 def load_model_and_tokenizer(offload=False):
-    """Charge un modèle de diffusion standard et applique LoRA.
+    """Charge les composants de Stable Diffusion et applique LoRA.
     
     Args:
         offload (bool): Si True, certains composants seront chargés sur CPU pour économiser la mémoire GPU.
@@ -127,39 +127,31 @@ def load_model_and_tokenizer(offload=False):
     device = "cuda" if torch.cuda.is_available() and not offload else "cpu"
     
     try:
-        logger.info("Chargement d'un modèle de diffusion standard...")
+        logger.info("Chargement des composants de Stable Diffusion...")
         logger.info(f"Mode d'offloading: {'activé' if offload else 'désactivé'}")
         
-        # Utiliser un modèle de diffusion standard comme Stable Diffusion
+        # Utiliser Stable Diffusion 2.1
         model_id = "stabilityai/stable-diffusion-2-1"
         
-        # Chargement des composants du modèle
-        logger.info("Chargement du tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        
-        logger.info("Chargement de l'encodeur de texte...")
-        text_encoder = T5EncoderModel.from_pretrained(
-            model_id, 
-            subfolder="text_encoder",
-            torch_dtype=torch_dtype,
-            device_map="auto" if (torch.cuda.is_available() and not offload) else None
-        )
-        
-        logger.info("Chargement du VAE...")
-        vae = AutoencoderKL.from_pretrained(
+        # Chargement du pipeline complet pour extraire les composants
+        logger.info("Chargement du pipeline Stable Diffusion...")
+        pipe = StableDiffusionPipeline.from_pretrained(
             model_id,
-            subfolder="vae",
             torch_dtype=torch_dtype,
-            device_map="auto" if (torch.cuda.is_available() and not offload) else None
+            use_safetensors=True,
+            variant="fp16" if torch.cuda.is_available() else None,
         )
         
-        logger.info("Chargement de l'UNet...")
-        unet = UNet2DConditionModel.from_pretrained(
-            model_id,
-            subfolder="unet",
-            torch_dtype=torch_dtype,
-            device_map="auto" if (torch.cuda.is_available() and not offload) else None
-        )
+        # Extraire les composants individuels
+        logger.info("Extraction des composants individuels...")
+        tokenizer = pipe.tokenizer
+        text_encoder = pipe.text_encoder
+        vae = pipe.vae
+        unet = pipe.unet
+        
+        # Libérer la mémoire du pipeline complet
+        del pipe
+        torch.cuda.empty_cache()
         
         # Créer un modèle composite pour l'entraînement LoRA
         model = type('DiffusionModel', (), {})()
@@ -168,7 +160,7 @@ def load_model_and_tokenizer(offload=False):
         model.tokenizer = tokenizer
         model.vae = vae
         
-        logger.info("Modèle de diffusion chargé avec succès.")
+        logger.info("Composants de Stable Diffusion extraits avec succès.")
         
         # Application de LoRA sur l'UNet
         logger.info("Application de LoRA sur l'UNet...")
@@ -187,12 +179,19 @@ def load_model_and_tokenizer(offload=False):
         text_lora_config = LoraConfig(
             r=32,
             lora_alpha=32,
-            target_modules=["q", "k", "v"],
+            target_modules=["q_proj", "k_proj", "v_proj"],
             lora_dropout=0.05,
             bias="none"
         )
         model.text_encoder = get_peft_model(model.text_encoder, text_lora_config)
         logger.info("LoRA appliqué à l'encodeur de texte")
+        
+        # Déplacer les modèles sur le GPU si disponible et si l'offloading n'est pas activé
+        if torch.cuda.is_available() and not offload:
+            logger.info("Déplacement des modèles sur GPU...")
+            model.unet = model.unet.to("cuda")
+            model.text_encoder = model.text_encoder.to("cuda")
+            model.vae = model.vae.to("cuda")
         
     except Exception as e:
         logger.error(f"Erreur lors du chargement du modèle : {e}")
@@ -368,15 +367,15 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
     
     # Créer un README détaillé
     with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
-        f.write("# Adaptateurs LoRA pour modèle de diffusion\n\n")
-        f.write("Ce dépôt contient des adaptateurs LoRA pour fine-tuner un modèle de diffusion.\n\n")
+        f.write("# Adaptateurs LoRA pour Stable Diffusion\n\n")
+        f.write("Ce dépôt contient des adaptateurs LoRA pour fine-tuner Stable Diffusion 2.1.\n\n")
         
         f.write("## Structure du dépôt\n\n")
         f.write("- `unet_lora/`: Adaptateur LoRA pour l'UNet\n")
         f.write("- `text_encoder_lora/`: Adaptateur LoRA pour l'encodeur de texte\n\n")
         
         f.write("## Utilisation\n\n")
-        f.write("Pour utiliser ces adaptateurs avec un modèle de diffusion:\n\n")
+        f.write("Pour utiliser ces adaptateurs avec Stable Diffusion:\n\n")
         f.write("```python\n")
         f.write("import torch\n")
         f.write("from diffusers import StableDiffusionPipeline\n")
@@ -404,7 +403,7 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
         f.write("- Rang (r): 32\n")
         f.write("- Alpha: 32\n")
         f.write("- Modules cibles UNet: to_q, to_k, to_v, to_out.0\n")
-        f.write("- Modules cibles Text Encoder: q, k, v\n")
+        f.write("- Modules cibles Text Encoder: q_proj, k_proj, v_proj\n")
         f.write("- Dropout: 0.05\n")
     
     logger.info(f"Adaptateurs LoRA et tokenizer exportés avec succès dans {abs_export_dir}")
@@ -419,7 +418,7 @@ def upload_to_hf(export_dir, repo_id):
 def main():
     """Fonction principale pour le fine-tuning avec LoRA."""
     try:
-        logger.info("=== Démarrage du fine-tuning avec LoRA ===")
+        logger.info("=== Démarrage du fine-tuning de Stable Diffusion avec LoRA ===")
         
         # Fixer les graines aléatoires
         set_seed(42)
@@ -511,7 +510,7 @@ def main():
                 project="diffusion_finetune",
                 config={
                     "learning_rate": trainer.args.learning_rate,
-                    "architecture": "Stable Diffusion avec LoRA",
+                    "architecture": "Stable Diffusion 2.1 avec LoRA",
                     "dataset": dataset_path,
                     "epochs": trainer.args.num_train_epochs,
                     "batch_size": trainer.args.per_device_train_batch_size,
