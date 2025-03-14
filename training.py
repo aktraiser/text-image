@@ -372,6 +372,12 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
     """Fonction d'entraînement personnalisée pour les modèles de diffusion avec LoRA."""
     logger.info("Configuration de l'entraînement personnalisée pour le modèle de diffusion...")
     
+    # Afficher les paramètres d'entraînement pour le débogage
+    logger.info(f"Paramètres d'entraînement effectifs: max_steps={training_args.max_steps}, "
+               f"num_train_epochs={training_args.num_train_epochs}, "
+               f"batch_size={training_args.per_device_train_batch_size}, "
+               f"gradient_accumulation_steps={training_args.gradient_accumulation_steps}")
+    
     try:
         # Création du DataLoader
         train_dataloader = torch.utils.data.DataLoader(
@@ -382,6 +388,17 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
             num_workers=training_args.dataloader_num_workers,
             pin_memory=training_args.dataloader_pin_memory,
         )
+        
+        # Afficher des informations sur le dataset et le nombre d'étapes attendu
+        num_batches = len(train_dataloader)
+        steps_per_epoch = num_batches // training_args.gradient_accumulation_steps
+        total_expected_steps = steps_per_epoch * training_args.num_train_epochs
+        
+        logger.info(f"Taille du dataset: {len(dataset)} exemples")
+        logger.info(f"Nombre de batches par epoch: {num_batches}")
+        logger.info(f"Étapes par epoch (après accumulation de gradient): {steps_per_epoch}")
+        logger.info(f"Nombre total d'étapes attendu pour {training_args.num_train_epochs} epochs: {total_expected_steps}")
+        logger.info(f"Limite max_steps: {training_args.max_steps}")
         
         # Vérifier que le DataLoader fonctionne en essayant de charger un batch
         logger.info("Vérification du DataLoader...")
@@ -792,7 +809,7 @@ def main():
             output_dir="./outputs",
             per_device_train_batch_size=gpu_recommendations["batch_size"] if gpu_recommendations else 1,
             gradient_accumulation_steps=gpu_recommendations["gradient_accumulation_steps"] if gpu_recommendations else 4,
-            num_train_epochs=1,
+            num_train_epochs=100,  # Augmenté de 1 à 100 pour atteindre les 500 étapes avec un petit dataset
             max_steps=500,  # Changé de 10 à 500 pour un entraînement plus long
             learning_rate=1e-4,
             optim=optim_choice,
