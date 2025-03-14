@@ -671,13 +671,13 @@ def main():
     trainer.train()
     
     # Sauvegarde du modèle final
-    if training_args.output_dir:
+    if trainer.args.output_dir:
         logger.info("Sauvegarde du modèle final...")
         trainer.save_model()
         
         # Sauvegarde du modèle complet (base + LoRA)
-        full_model_dir = os.path.join(training_args.output_dir, "full_model")
-        success = save_full_model(model, full_model_dir, training_args)
+        full_model_dir = os.path.join(trainer.args.output_dir, "full_model")
+        success = save_full_model(model, full_model_dir, trainer.args)
         
         if success:
             logger.info(f"Modèle complet sauvegardé avec succès dans: {full_model_dir}")
