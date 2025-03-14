@@ -367,6 +367,12 @@ def main():
                         help="Utiliser la quantification 4-bit")
     parser.add_argument("--cpu", action="store_true",
                         help="Forcer l'utilisation du CPU")
+    parser.add_argument("--prompt", type=str,
+                        help="Prompt à utiliser pour la génération (si non fourni, mode interactif)")
+    parser.add_argument("--output_dir", type=str, default="./generated_outputs",
+                        help="Dossier de sortie pour les images générées")
+    parser.add_argument("--size", type=str, default="832*480",
+                        help="Taille de l'image générée (format: largeur*hauteur)")
     
     args = parser.parse_args()
     
@@ -388,8 +394,77 @@ def main():
             device
         )
         
-        # Exécuter le mode interactif
-        interactive_evaluation(model, tokenizer, inference_config)
+        # Créer le dossier de sortie s'il n'existe pas
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # Mode interactif ou génération unique
+        if args.prompt:
+            logger.info(f"Génération avec le prompt: {args.prompt}")
+            
+            # Traiter la taille si spécifiée
+            size = None
+            if args.size:
+                try:
+                    width, height = map(int, args.size.split('*'))
+                    size = (width, height)
+                    logger.info(f"Taille d'image spécifiée: {width}x{height}")
+                except:
+                    logger.warning(f"Format de taille invalide: {args.size}, utilisation de la taille par défaut")
+            
+            # Générer la réponse
+            try:
+                # Adapter en fonction du type de modèle
+                if hasattr(model, 'generate') and callable(model.generate):
+                    # Pour les modèles texte standard
+                    response = generate_response(model, tokenizer, args.prompt, inference_config)
+                    
+                    # Sauvegarder la réponse dans un fichier texte
+                    output_file = os.path.join(args.output_dir, f"response_{int(time.time())}.txt")
+                    with open(output_file, 'w') as f:
+                        f.write(response)
+                    logger.info(f"Réponse sauvegardée dans {output_file}")
+                    
+                elif hasattr(model, 'unet') or 'Wan' in model_path:
+                    # Pour les modèles de génération d'images/vidéos
+                    logger.info("Utilisation du mode de génération d'image/vidéo")
+                    
+                    # Essayer d'utiliser la fonction de génération spécifique à Wan2.1 si disponible
+                    try:
+                        sys.path.append(os.path.abspath("Wan2_1"))
+                        from Wan2_1.generate import generate_video
+                        
+                        output_file = os.path.join(args.output_dir, f"output_{int(time.time())}.mp4")
+                        generate_video(
+                            model=model,
+                            prompt=args.prompt,
+                            output_path=output_file,
+                            size=size
+                        )
+                        logger.info(f"Vidéo générée et sauvegardée dans {output_file}")
+                    except (ImportError, AttributeError) as e:
+                        logger.error(f"Erreur lors de la génération avec Wan2.1: {e}")
+                        logger.info("Tentative de génération avec pipeline standard...")
+                        
+                        # Fallback à une pipeline standard de diffusion
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            model_path,
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                        )
+                        pipeline = pipeline.to("cuda" if torch.cuda.is_available() else "cpu")
+                        
+                        output_file = os.path.join(args.output_dir, f"image_{int(time.time())}.png")
+                        image = pipeline(args.prompt).images[0]
+                        image.save(output_file)
+                        logger.info(f"Image générée et sauvegardée dans {output_file}")
+                else:
+                    logger.error("Type de modèle non reconnu pour la génération")
+            except Exception as e:
+                logger.error(f"Erreur lors de la génération: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            # Mode interactif
+            interactive_evaluation(model, tokenizer, inference_config)
         
     except Exception as e:
         logger.error(f"Erreur: {e}")
