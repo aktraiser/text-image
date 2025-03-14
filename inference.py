@@ -125,85 +125,103 @@ def initialize_model(model_path, max_seq_length=2048, load_in_4bit=True, device=
         except Exception as e:
             logger.warning(f"Erreur lors du chargement de la configuration d'inférence: {e}")
     
-    # Vérifier si nous avons un modèle Wan2.1
-    is_wan_model = False
-    if os.path.exists(os.path.join(model_path, "unet")) or "Wan" in model_path:
-        is_wan_model = True
-        logger.info("Détection d'un modèle Wan2.1")
+    # Vérifier si nous avons un modèle de diffusion (Stable Diffusion)
+    is_diffusion_model = False
+    if os.path.exists(os.path.join(model_path, "unet")) or os.path.exists(os.path.join(model_path, "unet_lora")):
+        is_diffusion_model = True
+        logger.info("Détection d'un modèle de diffusion (Stable Diffusion)")
+    
+    # Vérifier si nous avons un modèle LoRA
+    is_lora_model = False
+    if os.path.exists(os.path.join(model_path, "unet_lora")) or os.path.exists(os.path.join(model_path, "text_encoder_lora")):
+        is_lora_model = True
+        logger.info("Détection d'adaptateurs LoRA")
     
     # Charger le modèle en fonction de son type
-    if is_wan_model:
-        # Cloner le dépôt Wan2.1 si nécessaire
-        clone_wan_repository()
+    if is_diffusion_model:
+        # Pour les modèles de diffusion (Stable Diffusion)
+        from diffusers import StableDiffusionPipeline, DiffusionPipeline
         
-        try:
-            # Essayer de charger le module generate.py directement
-            generate_module = load_module_from_file(os.path.join("Wan2_1", "generate.py"), "generate")
+        if is_lora_model:
+            # Charger le modèle de base puis appliquer les adaptateurs LoRA
+            logger.info("Chargement du modèle de base Stable Diffusion...")
             
-            if generate_module and hasattr(generate_module, "load_t2v_pipeline"):
-                # Charger le modèle avec la fonction personnalisée
-                model = generate_module.load_t2v_pipeline(
-                    task="t2v-14B",
-                    ckpt_dir=model_path,
-                    size="1280*720",  # Résolution par défaut
-                    device=device,
-                    dtype=dtype
+            try:
+                # Charger le modèle de base (Stable Diffusion 1.5 par défaut)
+                base_model_id = "runwayml/stable-diffusion-v1-5"
+                logger.info(f"Utilisation du modèle de base: {base_model_id}")
+                
+                # Charger le pipeline de base
+                pipe = StableDiffusionPipeline.from_pretrained(
+                    base_model_id,
+                    torch_dtype=dtype
                 )
-                logger.info("Modèle chargé avec succès via la pipeline personnalisée")
+                pipe = pipe.to(device)
                 
-                # Charger le tokenizer
-                from transformers import AutoTokenizer
-                try:
-                    tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_path, "tokenizer"))
-                    logger.info("Tokenizer chargé avec succès")
-                except Exception:
-                    logger.warning("Impossible de charger le tokenizer, utilisation de t5-base comme fallback")
-                    tokenizer = AutoTokenizer.from_pretrained("t5-base")
-            else:
-                raise ImportError("Impossible de trouver la fonction load_t2v_pipeline")
+                # Charger et appliquer les adaptateurs LoRA
+                logger.info("Application des adaptateurs LoRA...")
                 
-        except (ImportError, FileNotFoundError) as e:
-            # Fallback à une approche directe
-            logger.info(f"Utilisation de la méthode de fallback pour charger le modèle: {str(e)}")
-            
-            # Créer un wrapper simple autour du modèle
-            from transformers import AutoTokenizer
-            from diffusers import UNet2DConditionModel
-            
-            class WanModelWrapper:
-                def __init__(self, model_dir):
-                    self.model_dir = model_dir
-                    self.unet = None
-                    self.tokenizer = None
+                # Charger les adaptateurs LoRA pour l'UNet
+                if os.path.exists(os.path.join(model_path, "unet_lora")):
+                    from diffusers import UNet2DConditionModel
                     
-                    # Essayer de charger le composant UNet directement
-                    try:
-                        self.unet = UNet2DConditionModel.from_pretrained(
-                            os.path.join(model_dir, "unet"),
-                            torch_dtype=dtype
-                        )
-                        logger.info("Composant UNet chargé avec succès")
-                    except Exception as unet_error:
-                        logger.warning(f"Impossible de charger l'UNet: {str(unet_error)}")
+                    # Charger l'adaptateur LoRA pour l'UNet
+                    unet_lora_path = os.path.join(model_path, "unet_lora")
+                    logger.info(f"Chargement de l'adaptateur LoRA pour l'UNet depuis {unet_lora_path}")
                     
-                    # Charger le tokenizer
-                    try:
-                        self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
-                        logger.info("Tokenizer chargé avec succès")
-                    except Exception:
-                        logger.warning("Impossible de charger le tokenizer, utilisation de t5-base comme fallback")
-                        self.tokenizer = AutoTokenizer.from_pretrained("t5-base")
+                    # Appliquer l'adaptateur LoRA à l'UNet
+                    pipe.unet.load_attn_procs(unet_lora_path)
+                    logger.info("Adaptateur LoRA appliqué à l'UNet")
                 
-                def generate(self, **kwargs):
-                    # Implémentation simplifiée de la génération
-                    logger.info("Génération avec le modèle Wan")
-                    # Cette méthode devrait être adaptée en fonction des besoins spécifiques
-                    return kwargs.get("input_ids", None)
+                # Charger les adaptateurs LoRA pour l'encodeur de texte
+                if os.path.exists(os.path.join(model_path, "text_encoder_lora")):
+                    from diffusers import CLIPTextModel
+                    
+                    # Charger l'adaptateur LoRA pour l'encodeur de texte
+                    text_encoder_lora_path = os.path.join(model_path, "text_encoder_lora")
+                    logger.info(f"Chargement de l'adaptateur LoRA pour l'encodeur de texte depuis {text_encoder_lora_path}")
+                    
+                    # Appliquer l'adaptateur LoRA à l'encodeur de texte
+                    pipe.text_encoder.load_attn_procs(text_encoder_lora_path)
+                    logger.info("Adaptateur LoRA appliqué à l'encodeur de texte")
+                
+                # Utiliser le tokenizer du pipeline
+                tokenizer = pipe.tokenizer
+                logger.info("Tokenizer chargé depuis le pipeline")
+                
+                model = pipe
+                logger.info("Pipeline avec adaptateurs LoRA chargé avec succès")
+                
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement des adaptateurs LoRA: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+        else:
+            # Charger un modèle de diffusion complet
+            logger.info("Chargement d'un modèle de diffusion complet...")
             
-            model = WanModelWrapper(model_path)
-            tokenizer = model.tokenizer
+            try:
+                # Charger le pipeline complet
+                pipe = StableDiffusionPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype
+                )
+                pipe = pipe.to(device)
+                
+                # Utiliser le tokenizer du pipeline
+                tokenizer = pipe.tokenizer
+                
+                model = pipe
+                logger.info("Pipeline de diffusion chargé avec succès")
+                
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du modèle de diffusion: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
     else:
-        # Charger un modèle standard avec Unsloth si disponible
+        # Pour les modèles de langage (LLM)
         try:
             from unsloth import FastLanguageModel
             logger.info("Utilisation de Unsloth FastLanguageModel pour le chargement")
@@ -356,7 +374,7 @@ def interactive_evaluation(model, tokenizer, inference_config=None):
 
 def main():
     """Fonction principale"""
-    parser = argparse.ArgumentParser(description="Inférence avec un modèle Wan2.1 fine-tuné")
+    parser = argparse.ArgumentParser(description="Inférence avec un modèle fine-tuné")
     parser.add_argument("--model_path", type=str, default="/workspace/full_model", 
                         help="Chemin vers le modèle sauvegardé (par défaut: modèle complet)")
     parser.add_argument("--use_lora_only", action="store_true",
@@ -373,14 +391,29 @@ def main():
                         help="Dossier de sortie pour les images générées")
     parser.add_argument("--size", type=str, default="832*480",
                         help="Taille de l'image générée (format: largeur*hauteur)")
+    parser.add_argument("--num_inference_steps", type=int, default=50,
+                        help="Nombre d'étapes d'inférence pour les modèles de diffusion")
+    parser.add_argument("--guidance_scale", type=float, default=7.5,
+                        help="Échelle de guidance pour les modèles de diffusion")
     
     args = parser.parse_args()
+    
+    # Afficher les arguments pour le débogage
+    logger.info(f"Arguments reçus: {vars(args)}")
     
     # Déterminer le chemin du modèle
     model_path = args.model_path
     if args.use_lora_only:
         model_path = "hf_model_export"
         logger.info(f"Utilisation des poids LoRA uniquement depuis {model_path}")
+    
+    # Vérifier que le chemin du modèle existe
+    logger.info(f"Vérification du chemin du modèle: {model_path}")
+    if not os.path.exists(model_path):
+        logger.error(f"Le chemin du modèle {model_path} n'existe pas")
+        print(f"ERREUR: Le chemin du modèle '{model_path}' n'existe pas.")
+        print("Veuillez spécifier un chemin valide avec --model_path ou utiliser --use_lora_only")
+        return 1
     
     # Déterminer le périphérique
     device = "cpu" if args.cpu else None
@@ -413,8 +446,36 @@ def main():
             
             # Générer la réponse
             try:
-                # Adapter en fonction du type de modèle
-                if hasattr(model, 'generate') and callable(model.generate):
+                # Vérifier si nous avons un modèle de diffusion (StableDiffusionPipeline)
+                if hasattr(model, 'unet') and hasattr(model, 'vae') and hasattr(model, 'text_encoder'):
+                    # Pour les modèles de diffusion (Stable Diffusion)
+                    logger.info("Utilisation du mode de génération d'image avec Stable Diffusion")
+                    print("Génération d'image en cours...")
+                    
+                    # Préparer les paramètres d'inférence
+                    inference_params = {
+                        "prompt": args.prompt,
+                        "num_inference_steps": args.num_inference_steps,
+                        "guidance_scale": args.guidance_scale,
+                    }
+                    
+                    # Ajouter la taille si spécifiée
+                    if size:
+                        inference_params["width"] = size[0]
+                        inference_params["height"] = size[1]
+                    
+                    # Générer l'image
+                    output = model(**inference_params)
+                    
+                    # Sauvegarder l'image
+                    timestamp = int(time.time())
+                    output_file = os.path.join(args.output_dir, f"image_{timestamp}.png")
+                    output.images[0].save(output_file)
+                    
+                    logger.info(f"Image générée et sauvegardée dans {output_file}")
+                    print(f"Image générée et sauvegardée dans {output_file}")
+                    
+                elif hasattr(model, 'generate') and callable(model.generate):
                     # Pour les modèles texte standard
                     response = generate_response(model, tokenizer, args.prompt, inference_config)
                     
@@ -423,51 +484,60 @@ def main():
                     with open(output_file, 'w') as f:
                         f.write(response)
                     logger.info(f"Réponse sauvegardée dans {output_file}")
-                    
-                elif hasattr(model, 'unet') or 'Wan' in model_path:
-                    # Pour les modèles de génération d'images/vidéos
-                    logger.info("Utilisation du mode de génération d'image/vidéo")
-                    
-                    # Essayer d'utiliser la fonction de génération spécifique à Wan2.1 si disponible
-                    try:
-                        sys.path.append(os.path.abspath("Wan2_1"))
-                        from Wan2_1.generate import generate_video
-                        
-                        output_file = os.path.join(args.output_dir, f"output_{int(time.time())}.mp4")
-                        generate_video(
-                            model=model,
-                            prompt=args.prompt,
-                            output_path=output_file,
-                            size=size
-                        )
-                        logger.info(f"Vidéo générée et sauvegardée dans {output_file}")
-                    except (ImportError, AttributeError) as e:
-                        logger.error(f"Erreur lors de la génération avec Wan2.1: {e}")
-                        logger.info("Tentative de génération avec pipeline standard...")
-                        
-                        # Fallback à une pipeline standard de diffusion
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            model_path,
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-                        )
-                        pipeline = pipeline.to("cuda" if torch.cuda.is_available() else "cpu")
-                        
-                        output_file = os.path.join(args.output_dir, f"image_{int(time.time())}.png")
-                        image = pipeline(args.prompt).images[0]
-                        image.save(output_file)
-                        logger.info(f"Image générée et sauvegardée dans {output_file}")
+                    print(f"Réponse générée et sauvegardée dans {output_file}")
                 else:
                     logger.error("Type de modèle non reconnu pour la génération")
+                    print("ERREUR: Type de modèle non reconnu pour la génération")
             except Exception as e:
                 logger.error(f"Erreur lors de la génération: {e}")
+                print(f"ERREUR lors de la génération: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
         else:
             # Mode interactif
-            interactive_evaluation(model, tokenizer, inference_config)
+            if hasattr(model, 'unet') and hasattr(model, 'vae') and hasattr(model, 'text_encoder'):
+                print("\n" + "="*80)
+                print("Mode interactif d'évaluation du modèle de diffusion")
+                print("Tapez 'exit' à tout moment pour quitter")
+                print("="*80 + "\n")
+                
+                while True:
+                    try:
+                        prompt = input("\nEntrez un prompt (ou 'exit' pour quitter) : ")
+                        if prompt.lower() == 'exit':
+                            break
+                        
+                        print("\nGénération de l'image...")
+                        start_time = time.time()
+                        
+                        # Générer l'image
+                        output = model(
+                            prompt=prompt,
+                            num_inference_steps=args.num_inference_steps,
+                            guidance_scale=args.guidance_scale
+                        )
+                        
+                        # Sauvegarder l'image
+                        timestamp = int(time.time())
+                        output_file = os.path.join(args.output_dir, f"image_{timestamp}.png")
+                        output.images[0].save(output_file)
+                        
+                        print(f"\nImage générée et sauvegardée dans {output_file}")
+                        print(f"Temps de génération: {time.time() - start_time:.2f} secondes")
+                        
+                    except KeyboardInterrupt:
+                        print("\nInterruption détectée. Sortie du mode interactif.")
+                        break
+                    except Exception as e:
+                        logger.error(f"Erreur lors de la génération: {e}")
+                        print(f"\nUne erreur s'est produite: {e}")
+            else:
+                # Mode interactif pour les modèles de texte
+                interactive_evaluation(model, tokenizer, inference_config)
         
     except Exception as e:
         logger.error(f"Erreur: {e}")
+        print(f"ERREUR: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return 1
