@@ -15,9 +15,9 @@ from peft import LoraConfig, get_peft_model
 from diffusers import DiffusionPipeline
 from trl import SFTTrainer
 from datasets import Dataset
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi
 
-# Suppression d'avertissements non critiques et configuration du logger
+# Configuration du logger et gestion des avertissements
 warnings.filterwarnings("ignore", message=".*local_dir_use_symlinks.*")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,112 +32,29 @@ def check_dependencies():
             subprocess.run(["pip", "install", pkg], check=True)
             logger.info(f"{pkg} installé avec succès.")
 
-def clone_wan_repository():
-    """Clone le dépôt Wan2.1 si nécessaire."""
-    if not os.path.exists("Wan2_1"):
-        logger.info("Clonage du dépôt Wan2.1...")
-        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git", "Wan2_1"], check=True)
-        logger.info("Dépôt cloné avec succès.")
-    else:
-        logger.info("Dépôt déjà présent, clonage ignoré.")
-    sys.path.append(os.path.abspath("Wan2_1"))
-
-def download_model_weights(model_name="Wan-AI/Wan2.1-T2V-14B", local_dir="./Wan2.1-T2V-14B"):
-    """Télécharge les poids du modèle depuis Hugging Face."""
-    if not os.path.exists(local_dir):
-        os.makedirs(local_dir, exist_ok=True)
-        logger.info(f"Téléchargement des poids pour {model_name}...")
-        snapshot_download(repo_id=model_name, local_dir=local_dir, local_dir_use_symlinks=False)
-        logger.info(f"Poids téléchargés dans {local_dir}")
-    else:
-        logger.info(f"Le répertoire {local_dir} existe déjà, téléchargement ignoré.")
-    return local_dir
-
-def load_module_from_file(file_path, module_name):
-    """Charge dynamiquement un module Python depuis un fichier."""
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
 def load_model_and_tokenizer():
-    """Charge le modèle et le tokenizer, puis applique LoRA sur l'UNet et le text encoder."""
+    """Charge directement le modèle depuis Hugging Face et applique LoRA."""
     check_dependencies()
-    clone_wan_repository()
-    model_dir = download_model_weights()
     
-    repo_files = os.listdir("Wan2_1") if os.path.exists("Wan2_1") else []
-    logger.info(f"Fichiers dans le dépôt : {repo_files}")
-    model = None
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    device_map = "balanced" if torch.cuda.is_available() else None
 
     try:
-        # Tentative de chargement via generate.py
-        if "generate.py" in repo_files:
-            generate_module = load_module_from_file(os.path.join("Wan2_1", "generate.py"), "generate")
-            if generate_module:
-                available_funcs = [f for f in dir(generate_module) if callable(getattr(generate_module, f)) and not f.startswith("_")]
-                candidate_funcs = [f for f in available_funcs if "pipeline" in f.lower() or "load" in f.lower()]
-                for func_name in candidate_funcs:
-                    try:
-                        func = getattr(generate_module, func_name)
-                        model = func(
-                            task="t2v-14B",
-                            ckpt_dir=model_dir,
-                            size="1280*720",
-                            device="cuda" if torch.cuda.is_available() else "cpu",
-                            dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-                        )
-                        logger.info(f"Modèle chargé via generate.py ({func_name})")
-                        break
-                    except Exception as e:
-                        logger.warning(f"Échec avec {func_name} dans generate.py : {e}")
-                        continue
-        
-        # Recherche dans d'autres fichiers Python du dépôt
-        if model is None:
-            python_files = [f for f in repo_files if f.endswith(".py") and f != "generate.py"]
-            for py_file in python_files:
-                module = load_module_from_file(os.path.join("Wan2_1", py_file), py_file[:-3])
-                if module:
-                    available_funcs = [f for f in dir(module) if callable(getattr(module, f)) and not f.startswith("_")]
-                    candidate_funcs = [f for f in available_funcs if "pipeline" in f.lower() or "load" in f.lower()]
-                    for func_name in candidate_funcs:
-                        try:
-                            func = getattr(module, func_name)
-                            model = func(
-                                task="t2v-14B",
-                                ckpt_dir=model_dir,
-                                size="1280*720",
-                                device="cuda" if torch.cuda.is_available() else "cpu",
-                                dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-                            )
-                            logger.info(f"Modèle chargé via {py_file} ({func_name})")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Échec avec {py_file}.{func_name} : {e}")
-                            continue
-                    if model is not None:
-                        break
-        
-        # Si aucun chargement n'a réussi, utiliser DiffusionPipeline directement
-        if model is None:
-            logger.warning("Aucune fonction de chargement trouvée. Utilisation de DiffusionPipeline directement.")
-            model = DiffusionPipeline.from_pretrained(
-                model_dir,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="balanced" if torch.cuda.is_available() else None  # Changement ici
-            )
-            logger.info("Modèle chargé via DiffusionPipeline")
+        # Chargement direct depuis Hugging Face
+        model = DiffusionPipeline.from_pretrained(
+            "Wan-AI/Wan2.1-T2V-14B",
+            torch_dtype=torch_dtype,
+            device_map=device_map
+        )
+        logger.info("Modèle chargé directement depuis Hugging Face.")
     except Exception as e:
-        logger.error(f"Erreur lors du chargement du modèle : {e}")
+        logger.error(f"Erreur lors du chargement du modèle depuis Hugging Face : {e}")
         raise e
 
     if not hasattr(model, "unet") or model.unet is None:
         raise ValueError("L'UNet n'a pas été chargé correctement.")
 
-    # Application de LoRA sur l'UNet
+    # Configuration et application de LoRA sur l'UNet
     lora_config = LoraConfig(
         r=32,
         lora_alpha=32,
@@ -148,7 +65,7 @@ def load_model_and_tokenizer():
     model.unet = get_peft_model(model.unet, lora_config)
     logger.info("LoRA appliqué à l'UNet")
 
-    # Application de LoRA sur le text encoder (si présent)
+    # Si le modèle contient un text encoder, on applique LoRA dessus
     if hasattr(model, "text_encoder") and model.text_encoder is not None:
         text_lora_config = LoraConfig(
             r=32,
@@ -160,6 +77,7 @@ def load_model_and_tokenizer():
         model.text_encoder = get_peft_model(model.text_encoder, text_lora_config)
         logger.info("LoRA appliqué au text encoder")
 
+    # Chargement du tokenizer (si présent dans le pipeline, sinon fallback)
     tokenizer = getattr(model, "tokenizer", None)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained("t5-base")
@@ -277,7 +195,6 @@ def upload_to_hf(export_dir, repo_id):
 
 def main():
     try:
-        check_dependencies()
         model, tokenizer = load_model_and_tokenizer()
         dataset = prepare_dataset(tokenizer, "dataset")
         trainer = setup_trainer(model, tokenizer, dataset)
