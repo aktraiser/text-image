@@ -167,9 +167,9 @@ def load_model_and_tokenizer(offload=False):
         # Application de LoRA sur l'UNet
         logger.info("Application de LoRA sur l'UNet...")
         lora_config = LoraConfig(
-            r=32,
-            lora_alpha=32,
-            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+            r=64,
+            lora_alpha=64,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0", "proj_in", "proj_out", "conv1", "conv2"],
             lora_dropout=0.05,
             bias="none"
         )
@@ -179,9 +179,9 @@ def load_model_and_tokenizer(offload=False):
         # Application de LoRA sur le text encoder
         logger.info("Application de LoRA sur l'encodeur de texte...")
         text_lora_config = LoraConfig(
-            r=32,
-            lora_alpha=32,
-            target_modules=["q_proj", "k_proj", "v_proj"],
+            r=64,
+            lora_alpha=64,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
             lora_dropout=0.05,
             bias="none"
         )
@@ -360,8 +360,8 @@ def setup_trainer(model, tokenizer, dataset):
         per_device_train_batch_size=1,  # Taille de batch réduite pour éviter les OOM
         gradient_accumulation_steps=4,  # Accumulation de gradient pour simuler un batch plus grand
         num_train_epochs=1,
-        max_steps=1000,
-        learning_rate=1e-4,
+        max_steps=250,
+        learning_rate=2e-4,
         optim="adamw_8bit",  # Optimiseur 8-bit pour réduire l'utilisation mémoire
         logging_steps=50,  # Augmenté pour réduire la verbosité des logs
         save_steps=100,  # Augmenté pour sauvegarder moins fréquemment
@@ -692,10 +692,10 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
         
         f.write("## Configuration LoRA\n\n")
         f.write("Les adaptateurs ont été entraînés avec les paramètres suivants:\n\n")
-        f.write("- Rang (r): 32\n")
-        f.write("- Alpha: 32\n")
-        f.write("- Modules cibles UNet: to_q, to_k, to_v, to_out.0\n")
-        f.write("- Modules cibles Text Encoder: q_proj, k_proj, v_proj\n")
+        f.write("- Rang (r): 64\n")
+        f.write("- Alpha: 64\n")
+        f.write("- Modules cibles UNet: to_q, to_k, to_v, to_out.0, proj_in, proj_out, conv1, conv2\n")
+        f.write("- Modules cibles Text Encoder: q_proj, k_proj, v_proj, out_proj, fc1, fc2\n")
         f.write("- Dropout: 0.05\n")
     
     logger.info(f"Adaptateurs LoRA et tokenizer exportés avec succès dans {abs_export_dir}")
@@ -807,8 +807,8 @@ def main():
             per_device_train_batch_size=gpu_recommendations["batch_size"] if gpu_recommendations else 1,
             gradient_accumulation_steps=gpu_recommendations["gradient_accumulation_steps"] if gpu_recommendations else 4,
             num_train_epochs=1,
-            max_steps=1000,
-            learning_rate=1e-4,
+            max_steps=250,
+            learning_rate=2e-4,
             optim=optim_choice,
             logging_steps=50,
             save_steps=100,
