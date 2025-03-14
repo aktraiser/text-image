@@ -793,11 +793,11 @@ def main():
             per_device_train_batch_size=gpu_recommendations["batch_size"] if gpu_recommendations else 1,
             gradient_accumulation_steps=gpu_recommendations["gradient_accumulation_steps"] if gpu_recommendations else 4,
             num_train_epochs=1,
-            max_steps=10,
+            max_steps=500,  # Changé de 10 à 500 pour un entraînement plus long
             learning_rate=1e-4,
             optim=optim_choice,
-            logging_steps=1,
-            save_steps=5,
+            logging_steps=10,  # Changé de 1 à 10 pour réduire la verbosité des logs
+            save_steps=50,  # Augmenté de 5 à 50 pour sauvegarder moins fréquemment
             gradient_checkpointing=gpu_recommendations["gradient_checkpointing"] if gpu_recommendations else True,
             fp16=gpu_recommendations["fp16"] if gpu_recommendations else False,  # Désactivé par défaut pour éviter les conflits
             report_to="wandb",
