@@ -365,7 +365,7 @@ def setup_trainer(model, tokenizer, dataset):
 
 def train_diffusion_model(model, tokenizer, dataset, training_args):
     """Fonction d'entraînement personnalisée pour les modèles de diffusion avec LoRA."""
-    logger.info("Configuration de l'entraînement personnalisé pour le modèle de diffusion...")
+    logger.info("Configuration de l'entraînement personnalisée pour le modèle de diffusion...")
     
     try:
         # Création du DataLoader
@@ -393,13 +393,32 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
         
         logger.info(f"Nombre de paramètres LoRA à optimiser - UNet: {len(unet_params)}, Text Encoder: {len(text_encoder_params)}")
         
+        # Déterminer le type de données à utiliser
+        weight_dtype = torch.float16 if training_args.fp16 else torch.float32
+        
+        # Désactiver fp16 si on utilise l'optimiseur 8-bit pour éviter les conflits
+        if "adamw_8bit" in training_args.optim.lower():
+            logger.info("Optimiseur 8-bit détecté, désactivation de fp16 pour éviter les conflits")
+            training_args.fp16 = False
+            weight_dtype = torch.float32
+        
         # Utiliser l'optimiseur 8-bit AdamW pour économiser la mémoire
-        optimizer = bnb.optim.AdamW8bit(
-            unet_params + text_encoder_params,
-            lr=training_args.learning_rate,
-            betas=(0.9, 0.999),
-            weight_decay=0.01,
-        )
+        if "adamw_8bit" in training_args.optim.lower():
+            logger.info("Utilisation de l'optimiseur AdamW 8-bit")
+            optimizer = bnb.optim.AdamW8bit(
+                unet_params + text_encoder_params,
+                lr=training_args.learning_rate,
+                betas=(0.9, 0.999),
+                weight_decay=0.01,
+            )
+        else:
+            logger.info("Utilisation de l'optimiseur AdamW standard")
+            optimizer = torch.optim.AdamW(
+                unet_params + text_encoder_params,
+                lr=training_args.learning_rate,
+                betas=(0.9, 0.999),
+                weight_decay=0.01,
+            )
         
         # Nombre total d'étapes d'entraînement
         if training_args.max_steps > 0:
@@ -426,11 +445,7 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
         model.text_encoder.to(device)
         model.vae.to(device)
         
-        # Déterminer le type de données à utiliser
-        weight_dtype = torch.float16 if training_args.fp16 else torch.float32
-        
         # Convertir le VAE au même type de données que les entrées
-        # Si fp16 est activé, convertir le VAE en float16, sinon en float32
         model.vae.to(dtype=weight_dtype)
         logger.info(f"VAE converti en {weight_dtype}")
         
@@ -493,7 +508,11 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
                         )[0]
                     
                     # Prédire le bruit
-                    with torch.cuda.amp.autocast(enabled=training_args.fp16):
+                    if training_args.fp16:
+                        with torch.cuda.amp.autocast():
+                            noise_pred = model.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                            loss = torch.nn.functional.mse_loss(noise_pred, noise)
+                    else:
                         noise_pred = model.unet(noisy_latents, timesteps, encoder_hidden_states).sample
                         loss = torch.nn.functional.mse_loss(noise_pred, noise)
                     
@@ -509,11 +528,13 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
                     # Mise à jour des poids après accumulation de gradient
                     if (step + 1) % training_args.gradient_accumulation_steps == 0:
                         if training_args.fp16:
+                            # Avec précision mixte
                             scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(unet_params + text_encoder_params, 1.0)
                             scaler.step(optimizer)
                             scaler.update()
                         else:
+                            # Sans précision mixte
                             torch.nn.utils.clip_grad_norm_(unet_params + text_encoder_params, 1.0)
                             optimizer.step()
                         
@@ -698,6 +719,21 @@ def main():
         # Configuration de l'entraînement
         logger.info("Configuration de l'entraînement...")
         
+        # Choix de l'optimiseur
+        optim_choice = "adamw"  # Par défaut, utiliser AdamW standard
+        
+        # Demander à l'utilisateur s'il souhaite utiliser l'optimiseur 8-bit
+        use_8bit = input("Utiliser l'optimiseur 8-bit pour économiser la mémoire ? (yes/no, défaut: yes): ").strip().lower()
+        if not use_8bit or use_8bit in ["yes", "y", "oui", "o"]:
+            optim_choice = "adamw_8bit"
+            logger.info("Optimiseur 8-bit sélectionné.")
+            # Désactiver fp16 si on utilise l'optimiseur 8-bit pour éviter les conflits
+            if gpu_recommendations:
+                gpu_recommendations["fp16"] = False
+                logger.info("Précision mixte (fp16) désactivée pour éviter les conflits avec l'optimiseur 8-bit.")
+        else:
+            logger.info("Optimiseur standard sélectionné.")
+        
         # Ajuster les paramètres d'entraînement en fonction des recommandations GPU
         training_args = TrainingArguments(
             output_dir="./outputs",
@@ -706,11 +742,11 @@ def main():
             num_train_epochs=1,
             max_steps=10,
             learning_rate=1e-4,
-            optim="adamw_8bit",
+            optim=optim_choice,
             logging_steps=1,
             save_steps=5,
             gradient_checkpointing=gpu_recommendations["gradient_checkpointing"] if gpu_recommendations else True,
-            fp16=gpu_recommendations["fp16"] if gpu_recommendations else torch.cuda.is_available(),
+            fp16=gpu_recommendations["fp16"] if gpu_recommendations else False,  # Désactivé par défaut pour éviter les conflits
             report_to="wandb",
             logging_dir="./logs",
             save_strategy="steps",
@@ -719,6 +755,10 @@ def main():
             dataloader_num_workers=2,
             dataloader_pin_memory=True,
         )
+        
+        logger.info(f"Configuration d'entraînement: batch_size={training_args.per_device_train_batch_size}, "
+                   f"gradient_accumulation_steps={training_args.gradient_accumulation_steps}, "
+                   f"fp16={training_args.fp16}, optim={training_args.optim}")
         
         # Configuration de Weights & Biases
         wandb_entity = input("Entité Weights & Biases (laissez vide pour ignorer): ").strip()
@@ -733,7 +773,9 @@ def main():
                     "epochs": training_args.num_train_epochs,
                     "batch_size": training_args.per_device_train_batch_size,
                     "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-                    "offload": use_offload
+                    "offload": use_offload,
+                    "fp16": training_args.fp16,
+                    "optim": training_args.optim
                 }
             )
         else:
