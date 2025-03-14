@@ -130,7 +130,7 @@ def load_model_and_tokenizer(offload=False):
     try:
         logger.info("Chargement des composants de Stable Diffusion...")
         logger.info(f"Mode d'offloading: {'activé' if offload else 'désactivé'}")
-        logger.info(f"Type de données: {torch_dtype}")
+        logger.info(f"Type de données initial: {torch_dtype}")
         
         # Utiliser Stable Diffusion 2.1
         model_id = "stabilityai/stable-diffusion-2-1"
@@ -200,6 +200,11 @@ def load_model_and_tokenizer(offload=False):
             model.unet = model.unet.to(dtype=torch_dtype)
             model.text_encoder = model.text_encoder.to(dtype=torch_dtype)
             model.vae = model.vae.to(dtype=torch_dtype)
+            
+            # Vérifier les types de données après conversion
+            logger.info(f"Types de données après conversion - UNet: {model.unet.dtype if hasattr(model.unet, 'dtype') else 'N/A'}, "
+                       f"Text Encoder: {model.text_encoder.dtype if hasattr(model.text_encoder, 'dtype') else 'N/A'}, "
+                       f"VAE: {model.vae.dtype if hasattr(model.vae, 'dtype') else 'N/A'}")
         
     except Exception as e:
         logger.error(f"Erreur lors du chargement du modèle : {e}")
@@ -401,6 +406,12 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
             logger.info("Optimiseur 8-bit détecté, désactivation de fp16 pour éviter les conflits")
             training_args.fp16 = False
             weight_dtype = torch.float32
+            
+            # Convertir tous les modèles en float32 pour assurer la compatibilité avec l'optimiseur 8-bit
+            logger.info("Conversion de tous les modèles en float32 pour compatibilité avec l'optimiseur 8-bit")
+            model.unet = model.unet.to(dtype=torch.float32)
+            model.text_encoder = model.text_encoder.to(dtype=torch.float32)
+            model.vae = model.vae.to(dtype=torch.float32)
         
         # Utiliser l'optimiseur 8-bit AdamW pour économiser la mémoire
         if "adamw_8bit" in training_args.optim.lower():
@@ -445,9 +456,12 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
         model.text_encoder.to(device)
         model.vae.to(device)
         
-        # Convertir le VAE au même type de données que les entrées
-        model.vae.to(dtype=weight_dtype)
-        logger.info(f"VAE converti en {weight_dtype}")
+        # S'assurer que tous les modèles sont du même type de données
+        logger.info(f"Vérification que tous les modèles sont en {weight_dtype}")
+        model.unet = model.unet.to(dtype=weight_dtype)
+        model.text_encoder = model.text_encoder.to(dtype=weight_dtype)
+        model.vae = model.vae.to(dtype=weight_dtype)
+        logger.info(f"Tous les modèles convertis en {weight_dtype}")
         
         # Mettre le VAE en mode évaluation car nous ne l'entraînons pas
         model.vae.eval()
@@ -506,6 +520,18 @@ def train_diffusion_model(model, tokenizer, dataset, training_args):
                             input_ids=input_ids,
                             attention_mask=attention_mask
                         )[0]
+                    
+                    # Vérifier et convertir les types de données si nécessaire
+                    if encoder_hidden_states.dtype != weight_dtype:
+                        logger.info(f"Conversion des encoder_hidden_states de {encoder_hidden_states.dtype} à {weight_dtype}")
+                        encoder_hidden_states = encoder_hidden_states.to(dtype=weight_dtype)
+                    
+                    if noisy_latents.dtype != weight_dtype:
+                        logger.info(f"Conversion des noisy_latents de {noisy_latents.dtype} à {weight_dtype}")
+                        noisy_latents = noisy_latents.to(dtype=weight_dtype)
+                    
+                    if timesteps.dtype != torch.int64:
+                        timesteps = timesteps.to(dtype=torch.int64)
                     
                     # Prédire le bruit
                     if training_args.fp16:
@@ -679,6 +705,12 @@ def main():
         logger.info("Vérification des dépendances...")
         check_dependencies()
         
+        # Option de débogage
+        debug_mode = input("Activer le mode débogage pour plus d'informations ? (yes/no, défaut: no): ").strip().lower()
+        if debug_mode in ["yes", "y", "oui", "o"]:
+            logger.setLevel(logging.DEBUG)
+            logger.debug("Mode débogage activé - Affichage des informations détaillées")
+        
         # Vérification de la disponibilité du GPU
         use_offload = False
         if torch.cuda.is_available():
@@ -734,6 +766,27 @@ def main():
         else:
             logger.info("Optimiseur standard sélectionné.")
         
+        # Forcer le type de données
+        force_dtype = input("Forcer un type de données spécifique ? (float32/float16/auto, défaut: auto): ").strip().lower()
+        if force_dtype == "float32":
+            logger.info("Forçage du type de données à float32")
+            # Convertir tous les modèles en float32
+            model.unet = model.unet.to(dtype=torch.float32)
+            model.text_encoder = model.text_encoder.to(dtype=torch.float32)
+            model.vae = model.vae.to(dtype=torch.float32)
+            if gpu_recommendations:
+                gpu_recommendations["fp16"] = False
+        elif force_dtype == "float16" and torch.cuda.is_available():
+            logger.info("Forçage du type de données à float16")
+            # Convertir tous les modèles en float16
+            model.unet = model.unet.to(dtype=torch.float16)
+            model.text_encoder = model.text_encoder.to(dtype=torch.float16)
+            model.vae = model.vae.to(dtype=torch.float16)
+            if gpu_recommendations:
+                gpu_recommendations["fp16"] = True
+        else:
+            logger.info("Type de données automatique basé sur les recommandations")
+        
         # Ajuster les paramètres d'entraînement en fonction des recommandations GPU
         training_args = TrainingArguments(
             output_dir="./outputs",
@@ -759,6 +812,12 @@ def main():
         logger.info(f"Configuration d'entraînement: batch_size={training_args.per_device_train_batch_size}, "
                    f"gradient_accumulation_steps={training_args.gradient_accumulation_steps}, "
                    f"fp16={training_args.fp16}, optim={training_args.optim}")
+        
+        # Afficher les types de données des modèles avant l'entraînement
+        logger.info("Types de données des modèles avant l'entraînement:")
+        logger.info(f"UNet: {next(model.unet.parameters()).dtype}")
+        logger.info(f"Text Encoder: {next(model.text_encoder.parameters()).dtype}")
+        logger.info(f"VAE: {next(model.vae.parameters()).dtype}")
         
         # Configuration de Weights & Biases
         wandb_entity = input("Entité Weights & Biases (laissez vide pour ignorer): ").strip()
