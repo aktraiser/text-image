@@ -14,7 +14,7 @@ import random
 
 from transformers import AutoTokenizer, TrainingArguments, T5EncoderModel, CLIPVisionModel
 from peft import LoraConfig, get_peft_model
-from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+from diffusers import UNet2DConditionModel, AutoencoderKL, DiffusionPipeline
 from trl import SFTTrainer
 from datasets import Dataset
 from huggingface_hub import HfApi, hf_hub_download
@@ -116,7 +116,7 @@ def check_dependencies():
             logger.info(f"{pkg} installé avec succès.")
 
 def load_model_and_tokenizer(offload=False):
-    """Charge le modèle Wan2.1-I2V-14B-480P-Diffusers et applique LoRA.
+    """Charge un modèle de diffusion standard et applique LoRA.
     
     Args:
         offload (bool): Si True, certains composants seront chargés sur CPU pour économiser la mémoire GPU.
@@ -127,50 +127,48 @@ def load_model_and_tokenizer(offload=False):
     device = "cuda" if torch.cuda.is_available() and not offload else "cpu"
     
     try:
-        logger.info("Chargement du modèle Wan2.1-I2V-14B-480P-Diffusers...")
+        logger.info("Chargement d'un modèle de diffusion standard...")
         logger.info(f"Mode d'offloading: {'activé' if offload else 'désactivé'}")
         
-        # Modèle ID sur Hugging Face
-        model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+        # Utiliser un modèle de diffusion standard comme Stable Diffusion
+        model_id = "stabilityai/stable-diffusion-2-1"
         
         # Chargement des composants du modèle
-        logger.info("Chargement de l'encodeur d'image CLIP...")
-        image_encoder = CLIPVisionModel.from_pretrained(
-            model_id,
+        logger.info("Chargement du tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        
+        logger.info("Chargement de l'encodeur de texte...")
+        text_encoder = T5EncoderModel.from_pretrained(
+            model_id, 
+            subfolder="text_encoder",
             torch_dtype=torch_dtype,
             device_map="auto" if (torch.cuda.is_available() and not offload) else None
         )
         
         logger.info("Chargement du VAE...")
-        vae = AutoencoderKLWan.from_pretrained(
+        vae = AutoencoderKL.from_pretrained(
             model_id,
+            subfolder="vae",
             torch_dtype=torch_dtype,
             device_map="auto" if (torch.cuda.is_available() and not offload) else None
         )
         
-        logger.info("Chargement du pipeline complet...")
-        pipe = WanImageToVideoPipeline.from_pretrained(
+        logger.info("Chargement de l'UNet...")
+        unet = UNet2DConditionModel.from_pretrained(
             model_id,
-            image_encoder=image_encoder,
-            vae=vae,
+            subfolder="unet",
             torch_dtype=torch_dtype,
             device_map="auto" if (torch.cuda.is_available() and not offload) else None
         )
-        
-        # Chargement du tokenizer
-        logger.info("Chargement du tokenizer...")
-        tokenizer = pipe.tokenizer
         
         # Créer un modèle composite pour l'entraînement LoRA
-        model = type('WanModel', (), {})()
-        model.unet = pipe.unet
-        model.text_encoder = pipe.text_encoder
+        model = type('DiffusionModel', (), {})()
+        model.unet = unet
+        model.text_encoder = text_encoder
         model.tokenizer = tokenizer
         model.vae = vae
-        model.image_encoder = image_encoder
-        model.pipe = pipe
         
-        logger.info("Modèle Wan2.1-I2V-14B-480P-Diffusers chargé avec succès.")
+        logger.info("Modèle de diffusion chargé avec succès.")
         
         # Application de LoRA sur l'UNet
         logger.info("Application de LoRA sur l'UNet...")
@@ -214,9 +212,9 @@ def prepare_dataset(tokenizer, data_path="dataset"):
         logger.warning(f"Le répertoire {data_path} n'existait pas et a été créé. Veuillez y ajouter vos données.")
         return None
     
-    # Prétraitement adapté au modèle Wan2.1
+    # Prétraitement standard pour les modèles de diffusion
     preprocess = transforms.Compose([
-        transforms.Resize((480, 832)),  # Résolution 480P pour Wan2.1-I2V-14B-480P
+        transforms.Resize((512, 512)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
@@ -276,8 +274,8 @@ def prepare_dataset(tokenizer, data_path="dataset"):
     logger.info(f"Dataset prêt avec {len(dataset)} paires image-texte valides")
     return dataset
 
-def wan_data_collator(examples, tokenizer):
-    """Collateur adapté au modèle Wan2.1-I2V-14B-480P-Diffusers."""
+def data_collator(examples, tokenizer):
+    """Collateur adapté aux modèles de diffusion standard."""
     batch = {}
     
     # Collecter les input_ids pour l'encodeur de texte
@@ -297,8 +295,8 @@ def wan_data_collator(examples, tokenizer):
     return batch
 
 def setup_trainer(model, tokenizer, dataset):
-    """Configure l'entraîneur et l'intégration W&B pour le fine-tuning de Wan2.1."""
-    os.environ["WANDB_PROJECT"] = "wan_finetune"
+    """Configure l'entraîneur et l'intégration W&B pour le fine-tuning."""
+    os.environ["WANDB_PROJECT"] = "diffusion_finetune"
     
     # Configuration des arguments d'entraînement
     training_args = TrainingArguments(
@@ -328,7 +326,7 @@ def setup_trainer(model, tokenizer, dataset):
         args=training_args,
         train_dataset=dataset,
         tokenizer=tokenizer,
-        data_collator=lambda examples: wan_data_collator(examples, tokenizer)
+        data_collator=lambda examples: data_collator(examples, tokenizer)
     )
     
     logger.info("Trainer configuré pour l'UNet avec LoRA")
@@ -370,26 +368,23 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
     
     # Créer un README détaillé
     with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
-        f.write("# Adaptateurs LoRA pour Wan2.1-I2V-14B-480P-Diffusers\n\n")
-        f.write("Ce dépôt contient des adaptateurs LoRA pour fine-tuner le modèle Wan2.1-I2V-14B-480P-Diffusers.\n\n")
+        f.write("# Adaptateurs LoRA pour modèle de diffusion\n\n")
+        f.write("Ce dépôt contient des adaptateurs LoRA pour fine-tuner un modèle de diffusion.\n\n")
         
         f.write("## Structure du dépôt\n\n")
         f.write("- `unet_lora/`: Adaptateur LoRA pour l'UNet\n")
         f.write("- `text_encoder_lora/`: Adaptateur LoRA pour l'encodeur de texte\n\n")
         
         f.write("## Utilisation\n\n")
-        f.write("Pour utiliser ces adaptateurs avec le modèle Wan2.1-I2V-14B-480P-Diffusers:\n\n")
+        f.write("Pour utiliser ces adaptateurs avec un modèle de diffusion:\n\n")
         f.write("```python\n")
         f.write("import torch\n")
-        f.write("from transformers import CLIPVisionModel\n")
-        f.write("from diffusers import AutoencoderKLWan, WanImageToVideoPipeline\n")
+        f.write("from diffusers import StableDiffusionPipeline\n")
         f.write("from peft import PeftModel\n\n")
         
-        f.write("# Charger les composants du modèle de base\n")
-        f.write("model_id = 'Wan-AI/Wan2.1-I2V-14B-480P-Diffusers'\n")
-        f.write("image_encoder = CLIPVisionModel.from_pretrained(model_id)\n")
-        f.write("vae = AutoencoderKLWan.from_pretrained(model_id)\n")
-        f.write("pipe = WanImageToVideoPipeline.from_pretrained(model_id, image_encoder=image_encoder, vae=vae)\n\n")
+        f.write("# Charger le modèle de base\n")
+        f.write("model_id = 'stabilityai/stable-diffusion-2-1'\n")
+        f.write("pipe = StableDiffusionPipeline.from_pretrained(model_id)\n\n")
         
         f.write("# Appliquer les adaptateurs LoRA\n")
         f.write("pipe.unet = PeftModel.from_pretrained(pipe.unet, 'path/to/unet_lora')\n")
@@ -398,12 +393,10 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
         f.write("# Déplacer sur GPU si disponible\n")
         f.write("pipe = pipe.to('cuda')\n\n")
         
-        f.write("# Générer une vidéo\n")
-        f.write("from diffusers.utils import load_image, export_to_video\n")
-        f.write("image = load_image('chemin/vers/image.jpg')\n")
-        f.write("prompt = 'Description de la vidéo souhaitée'\n")
-        f.write("video_frames = pipe(prompt=prompt, image=image).frames[0]\n")
-        f.write("export_to_video(video_frames, 'video_resultat.mp4')\n")
+        f.write("# Générer une image\n")
+        f.write("prompt = 'Description de l\\'image souhaitée'\n")
+        f.write("image = pipe(prompt=prompt).images[0]\n")
+        f.write("image.save('image_resultat.png')\n")
         f.write("```\n\n")
         
         f.write("## Configuration LoRA\n\n")
@@ -424,9 +417,9 @@ def upload_to_hf(export_dir, repo_id):
     logger.info(f"Modèle téléversé sur {repo_id}")
 
 def main():
-    """Fonction principale pour le fine-tuning du modèle Wan2.1 avec LoRA."""
+    """Fonction principale pour le fine-tuning avec LoRA."""
     try:
-        logger.info("=== Démarrage du fine-tuning de Wan2.1-I2V-14B-480P-Diffusers avec LoRA ===")
+        logger.info("=== Démarrage du fine-tuning avec LoRA ===")
         
         # Fixer les graines aléatoires
         set_seed(42)
@@ -460,7 +453,7 @@ def main():
         create_sample_dataset(dataset_path)
         
         # Chargement du modèle et du tokenizer avec offloading si nécessaire
-        logger.info("Chargement des composants du modèle Wan2.1...")
+        logger.info("Chargement des composants du modèle...")
         model, tokenizer = load_model_and_tokenizer(offload=use_offload)
         logger.info("Modèle et tokenizer chargés avec succès.")
         
@@ -502,7 +495,7 @@ def main():
             args=training_args,
             train_dataset=dataset,
             tokenizer=tokenizer,
-            data_collator=lambda examples: wan_data_collator(examples, tokenizer)
+            data_collator=lambda examples: data_collator(examples, tokenizer)
         )
         
         logger.info(f"Trainer configuré avec batch_size={training_args.per_device_train_batch_size}, "
@@ -515,10 +508,10 @@ def main():
         if wandb_entity:
             wandb.init(
                 entity=wandb_entity,
-                project="wan_finetune",
+                project="diffusion_finetune",
                 config={
                     "learning_rate": trainer.args.learning_rate,
-                    "architecture": "Wan2.1-I2V-14B-480P-Diffusers avec LoRA",
+                    "architecture": "Stable Diffusion avec LoRA",
                     "dataset": dataset_path,
                     "epochs": trainer.args.num_train_epochs,
                     "batch_size": trainer.args.per_device_train_batch_size,
