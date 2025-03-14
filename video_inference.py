@@ -1,5 +1,5 @@
 import torch
-from diffusers import DiffusionPipeline, AutoPipelineForText2Video
+from diffusers import DiffusionPipeline, StableDiffusionPipeline, TextToVideoSDPipeline
 import json
 import os
 import argparse
@@ -112,7 +112,7 @@ def initialize_video_model(model_path, use_fp16=True, device=None):
                 logger.info(f"Utilisation du modèle de base: {base_model_id}")
                 
                 # Charger le pipeline de base
-                pipeline = AutoPipelineForText2Video.from_pretrained(
+                pipeline = TextToVideoSDPipeline.from_pretrained(
                     base_model_id,
                     torch_dtype=dtype,
                     variant="fp16" if use_fp16 else None
@@ -147,7 +147,7 @@ def initialize_video_model(model_path, use_fp16=True, device=None):
             else:
                 # C'est un modèle complet
                 logger.info("Chargement d'un modèle complet...")
-                pipeline = AutoPipelineForText2Video.from_pretrained(
+                pipeline = TextToVideoSDPipeline.from_pretrained(
                     model_path,
                     torch_dtype=dtype,
                     variant="fp16" if use_fp16 else None
@@ -155,14 +155,18 @@ def initialize_video_model(model_path, use_fp16=True, device=None):
         else:
             # C'est un ID de modèle Hugging Face
             logger.info(f"Chargement du modèle depuis Hugging Face: {model_path}")
-            pipeline = AutoPipelineForText2Video.from_pretrained(
+            pipeline = TextToVideoSDPipeline.from_pretrained(
                 model_path,
                 torch_dtype=dtype,
                 variant="fp16" if use_fp16 else None
             )
         
         # Activer l'offload du modèle sur CPU pour économiser de la mémoire
-        pipeline.enable_model_cpu_offload()
+        if hasattr(pipeline, "enable_model_cpu_offload"):
+            pipeline.enable_model_cpu_offload()
+        else:
+            # Fallback pour les versions plus anciennes
+            pipeline = pipeline.to(device)
         
         # Activer les techniques d'optimisation de mémoire
         if hasattr(pipeline, "vae"):
@@ -221,20 +225,39 @@ def generate_video(pipeline, prompt, negative_prompt=None, num_frames=24, num_in
         # Générer la vidéo
         from diffusers.utils import export_to_video
         
-        result = pipeline(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            generator=generator,
-            decode_chunk_size=2  # Pour économiser la mémoire
-        )
+        # Adapter les paramètres en fonction du type de pipeline
+        if hasattr(pipeline, "num_frames"):
+            # Pour les pipelines qui supportent directement num_frames
+            result = pipeline(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                generator=generator,
+            )
+        else:
+            # Pour les pipelines qui utilisent un autre paramètre ou format
+            result = pipeline(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                height=height,
+                width=width,
+                generator=generator,
+            )
         
         # Récupérer les frames du résultat
-        frames = result.frames[0]
+        if hasattr(result, "frames") and isinstance(result.frames, list):
+            frames = result.frames[0]
+        elif hasattr(result, "videos") and isinstance(result.videos, list):
+            frames = result.videos[0]
+        else:
+            # Fallback pour d'autres formats de résultat
+            frames = result.images
         
         # Générer un nom de fichier unique basé sur le timestamp
         timestamp = int(time.time())
