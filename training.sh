@@ -138,12 +138,14 @@ def main():
         dtype = torch.float32
         print("Utilisation de float32 sur CPU")
     
-    # Charger le modèle de base
-    print("Chargement du modèle de base Stable Diffusion...")
-    base_model_id = "runwayml/stable-diffusion-v1-5"
+    # Charger le modèle de base - Utiliser Stable Diffusion 2.1 comme dans l'entraînement
+    print("Chargement du modèle de base Stable Diffusion 2.1...")
+    base_model_id = "stabilityai/stable-diffusion-2-1"
     pipe = StableDiffusionPipeline.from_pretrained(
         base_model_id,
-        torch_dtype=dtype
+        torch_dtype=dtype,
+        use_safetensors=True,
+        variant="fp16" if torch.cuda.is_available() else None,
     )
     
     # Déplacer le modèle sur GPU si disponible
