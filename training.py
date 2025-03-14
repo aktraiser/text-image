@@ -17,74 +17,63 @@ from trl import SFTTrainer
 from datasets import Dataset
 from huggingface_hub import HfApi, snapshot_download
 
-# Configuration du logger
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# Suppression d'avertissements inutiles
+# Suppression d'avertissements non critiques et configuration du logger
 warnings.filterwarnings("ignore", message=".*local_dir_use_symlinks.*")
-torch.cuda.empty_cache()  # Libération de la mémoire GPU
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+torch.cuda.empty_cache()
 
 def check_dependencies():
     """Vérifie et installe les dépendances manquantes."""
-    required = ["torch", "transformers", "peft", "diffusers", "trl", "datasets", "easydict", "wandb"]
+    required = ["torch", "transformers", "peft", "diffusers", "trl", "datasets", "wandb"]
     for pkg in required:
         if importlib.util.find_spec(pkg) is None:
             logger.warning(f"{pkg} n'est pas installé. Installation en cours...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+            subprocess.run(["pip", "install", pkg], check=True)
             logger.info(f"{pkg} installé avec succès.")
 
-def clone_repository(repo_url="https://github.com/Wan-Video/Wan2.1.git", clone_dir="Wan2_1"):
-    """Clone le dépôt contenant le code du modèle."""
-    if not os.path.exists(clone_dir):
-        logger.info("Clonage du dépôt...")
-        try:
-            subprocess.check_call(["git", "clone", repo_url, clone_dir])
-            logger.info("Dépôt cloné avec succès.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Erreur lors du clonage du dépôt : {e}")
-            raise e
+def clone_wan_repository():
+    """Clone le dépôt Wan2.1 si nécessaire."""
+    if not os.path.exists("Wan2_1"):
+        logger.info("Clonage du dépôt Wan2.1...")
+        subprocess.run(["git", "clone", "https://github.com/Wan-Video/Wan2.1.git", "Wan2_1"], check=True)
+        logger.info("Dépôt cloné avec succès.")
     else:
         logger.info("Dépôt déjà présent, clonage ignoré.")
-    sys.path.append(os.path.abspath(clone_dir))
+    sys.path.append(os.path.abspath("Wan2_1"))
 
-def download_model_weights(model_name="Wan-AI/Wan2.1-T2V-14B", local_dir="Wan2.1-T2V-14B"):
+def download_model_weights(model_name="Wan-AI/Wan2.1-T2V-14B", local_dir="./Wan2.1-T2V-14B"):
     """Télécharge les poids du modèle depuis Hugging Face."""
     if not os.path.exists(local_dir):
         os.makedirs(local_dir, exist_ok=True)
-        logger.info("Téléchargement des poids du modèle...")
+        logger.info(f"Téléchargement des poids pour {model_name}...")
         snapshot_download(repo_id=model_name, local_dir=local_dir, local_dir_use_symlinks=False)
-        logger.info("Téléchargement terminé.")
+        logger.info(f"Poids téléchargés dans {local_dir}")
     else:
-        logger.info("Répertoire existant pour les poids, téléchargement ignoré.")
+        logger.info(f"Le répertoire {local_dir} existe déjà, téléchargement ignoré.")
     return local_dir
 
 def load_module_from_file(file_path, module_name):
-    """Charge dynamiquement un module à partir d'un fichier."""
+    """Charge dynamiquement un module Python depuis un fichier."""
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec is None:
-        logger.error(f"Impossible de charger le module {module_name} depuis {file_path}")
         return None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 def load_model_and_tokenizer():
-    """Charge le modèle et le tokenizer, et configure LoRA sur l'UNet et le text encoder."""
+    """Charge le modèle et le tokenizer, puis applique LoRA sur l'UNet et le text encoder."""
     check_dependencies()
-    clone_repository()
+    clone_wan_repository()
     model_dir = download_model_weights()
-
+    
     repo_files = os.listdir("Wan2_1") if os.path.exists("Wan2_1") else []
-    logger.info(f"Fichiers présents dans le dépôt : {repo_files}")
-
+    logger.info(f"Fichiers dans le dépôt : {repo_files}")
     model = None
 
     try:
-        # Tentative via generate.py
+        # Tentative de chargement via generate.py
         if "generate.py" in repo_files:
             generate_module = load_module_from_file(os.path.join("Wan2_1", "generate.py"), "generate")
             if generate_module:
@@ -100,11 +89,12 @@ def load_model_and_tokenizer():
                             device="cuda" if torch.cuda.is_available() else "cpu",
                             dtype=torch.float16 if torch.cuda.is_available() else torch.float32
                         )
-                        logger.info(f"Modèle chargé avec succès via generate.py ({func_name})")
+                        logger.info(f"Modèle chargé via generate.py ({func_name})")
                         break
                     except Exception as e:
                         logger.warning(f"Échec avec {func_name} dans generate.py : {e}")
                         continue
+        
         # Recherche dans d'autres fichiers Python du dépôt
         if model is None:
             python_files = [f for f in repo_files if f.endswith(".py") and f != "generate.py"]
@@ -130,13 +120,14 @@ def load_model_and_tokenizer():
                             continue
                     if model is not None:
                         break
-        # En dernier recours, utilisation directe de DiffusionPipeline
+        
+        # Si aucun chargement n'a réussi, utiliser DiffusionPipeline directement
         if model is None:
             logger.warning("Aucune fonction de chargement trouvée. Utilisation de DiffusionPipeline directement.")
             model = DiffusionPipeline.from_pretrained(
                 model_dir,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None
+                device_map="balanced" if torch.cuda.is_available() else None  # Changement ici
             )
             logger.info("Modèle chargé via DiffusionPipeline")
     except Exception as e:
@@ -147,76 +138,77 @@ def load_model_and_tokenizer():
         raise ValueError("L'UNet n'a pas été chargé correctement.")
 
     # Application de LoRA sur l'UNet
-    lora_config_unet = LoraConfig(
+    lora_config = LoraConfig(
         r=32,
         lora_alpha=32,
         target_modules=["to_q", "to_k", "to_v", "to_out.0"],
         lora_dropout=0.05,
         bias="none"
     )
-    model.unet = get_peft_model(model.unet, lora_config_unet)
+    model.unet = get_peft_model(model.unet, lora_config)
     logger.info("LoRA appliqué à l'UNet")
 
-    # Application de LoRA sur le text encoder, si présent
+    # Application de LoRA sur le text encoder (si présent)
     if hasattr(model, "text_encoder") and model.text_encoder is not None:
-        lora_config_text = LoraConfig(
+        text_lora_config = LoraConfig(
             r=32,
             lora_alpha=32,
             target_modules=["q", "k", "v"],
             lora_dropout=0.05,
             bias="none"
         )
-        model.text_encoder = get_peft_model(model.text_encoder, lora_config_text)
+        model.text_encoder = get_peft_model(model.text_encoder, text_lora_config)
         logger.info("LoRA appliqué au text encoder")
 
     tokenizer = getattr(model, "tokenizer", None)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained("t5-base")
         logger.info("Fallback sur le tokenizer t5-base")
+    
     return model, tokenizer
 
-def prepare_dataset(tokenizer, data_dir="dataset"):
-    """Prépare le dataset en associant images et textes, et applique le prétraitement."""
+def prepare_dataset(tokenizer, data_path="dataset"):
+    """Prépare le dataset en associant images et textes avec prétraitement."""
+    logger.info(f"Chargement des données depuis : {data_path}")
     preprocess = transforms.Compose([
         transforms.Resize((720, 1280)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
     image_text_pairs = []
-    for file in os.listdir(data_dir):
+    for file in os.listdir(data_path):
         if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-            image_path = os.path.join(data_dir, file)
+            image_path = os.path.join(data_path, file)
             base_name = os.path.splitext(file)[0]
-            text_file = os.path.join(data_dir, f"{base_name}.txt")
-            if os.path.exists(text_file):
-                with open(text_file, "r", encoding="utf-8") as f:
-                    text = f.read().strip()
-            else:
-                text = base_name.replace("_", " ")
-            image_text_pairs.append({"image_path": image_path, "text": text + " TOK"})
+            text_path = os.path.join(data_path, f"{base_name}.txt")
+            text = open(text_path, 'r', encoding='utf-8').read().strip() if os.path.exists(text_path) else base_name.replace('_', ' ')
+            image_text_pairs.append({"image_path": image_path, "text": f"{text} TOK"})
+    
     dataset = Dataset.from_dict({
         "image_path": [item["image_path"] for item in image_text_pairs],
         "text": [item["text"] for item in image_text_pairs]
     })
+    
     def load_and_preprocess(example):
         image = Image.open(example["image_path"]).convert("RGB")
         example["image"] = preprocess(image)
         return example
+    
     dataset = dataset.map(load_and_preprocess)
-    logger.info(f"Dataset préparé avec {len(dataset)} échantillons")
+    logger.info(f"Dataset prêt avec {len(dataset)} paires image-texte")
     return dataset
 
-def data_collator(examples, tokenizer):
-    """Collateur pour préparer les batchs d'entraînement."""
+def wan_data_collator(examples, tokenizer):
+    """Collateur adapté aux modèles de diffusion."""
     texts = [ex["text"] for ex in examples]
     text_inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
     images = torch.stack([ex["image"] for ex in examples])
     text_inputs["images"] = images
-    text_inputs["labels"] = images  # Les images sont les labels pour la diffusion
+    text_inputs["labels"] = images  # Les images servent de labels
     return text_inputs
 
 def setup_trainer(model, tokenizer, dataset):
-    """Configure l'entraîneur avec les hyperparamètres et l'intégration W&B."""
+    """Configure l'entraîneur et l'intégration W&B."""
     os.environ["WANDB_PROJECT"] = "wan_finetune"
     training_args = TrainingArguments(
         output_dir="./outputs",
@@ -236,24 +228,24 @@ def setup_trainer(model, tokenizer, dataset):
         remove_unused_columns=False,
     )
     trainer = SFTTrainer(
-        model=model.unet,  # On entraîne l'UNet avec LoRA
+        model=model.unet,  # Entraînement de l'UNet avec LoRA
         args=training_args,
         train_dataset=dataset,
         tokenizer=tokenizer,
-        data_collator=lambda examples: data_collator(examples, tokenizer)
+        data_collator=lambda examples: wan_data_collator(examples, tokenizer)
     )
     return trainer
 
-def check_disk_space(required_gb=10):
-    """Vérifie que l'espace disque disponible est suffisant."""
+def check_disk_space(required_space_gb=10):
+    """Vérifie l'espace disque disponible."""
     total, used, free = shutil.disk_usage("/")
     free_gb = free / (1024**3)
-    if free_gb < required_gb:
-        raise RuntimeError(f"Espace disque insuffisant : {free_gb:.2f}GB disponibles, {required_gb}GB requis.")
+    if free_gb < required_space_gb:
+        raise RuntimeError(f"Espace disque insuffisant : {free_gb:.2f} GB disponibles, {required_space_gb} GB requis.")
 
 def export_model(model, tokenizer, export_dir="hf_model_export"):
-    """Exporte le modèle finetuné et le tokenizer, avec sauvegarde des poids LoRA."""
-    check_disk_space(required_gb=10)
+    """Exporte le modèle finetuné et le tokenizer."""
+    check_disk_space(required_space_gb=10)
     os.makedirs(export_dir, exist_ok=True)
     abs_export_dir = os.path.abspath(export_dir)
     logger.info(f"Exportation du modèle dans {abs_export_dir}")
@@ -265,38 +257,31 @@ def export_model(model, tokenizer, export_dir="hf_model_export"):
     if tokenizer:
         tokenizer.save_pretrained(export_dir)
     
-    # Création d'un README explicatif
-    readme_path = os.path.join(export_dir, "README.md")
-    with open(readme_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
         f.write("# Modèle Wan2.1 Fine-Tuné avec LoRA\n\n")
         f.write("Ce dossier contient les poids LoRA pour l'UNet et le text encoder.\n")
-        f.write("Pour charger le modèle avec LoRA, utilisez :\n")
+        f.write("Pour charger le modèle avec LoRA :\n")
         f.write("```python\n")
         f.write("from peft import PeftModel\n")
-        f.write("base_model = ...  # Charger le modèle de base Wan2.1-T2V-14B\n")
+        f.write("base_model = ...  # Charger Wan2.1-T2V-14B\n")
         f.write("model.unet = PeftModel.from_pretrained(base_model.unet, 'unet_lora')\n")
         f.write("model.text_encoder = PeftModel.from_pretrained(base_model.text_encoder, 'text_encoder_lora')\n")
         f.write("```\n")
     logger.info("Modèle exporté avec succès.")
 
 def upload_to_hf(export_dir, repo_id):
-    """Téléverse le modèle exporté sur Hugging Face."""
+    """Téléverse le modèle sur Hugging Face."""
     api = HfApi()
-    api.upload_folder(
-        folder_path=export_dir,
-        repo_id=repo_id,
-        repo_type="model",
-    )
+    api.upload_folder(folder_path=export_dir, repo_id=repo_id, repo_type="model")
     logger.info(f"Modèle téléversé sur {repo_id}")
 
 def main():
     try:
         check_dependencies()
         model, tokenizer = load_model_and_tokenizer()
-        dataset = prepare_dataset(tokenizer, data_dir="dataset")
+        dataset = prepare_dataset(tokenizer, "dataset")
         trainer = setup_trainer(model, tokenizer, dataset)
         
-        # Initialisation de Weights & Biases
         wandb.init(
             entity="votre_entite",  # Remplacez par votre entité W&B
             project="wan_finetune",
@@ -317,9 +302,8 @@ def main():
         
         export_model(model, tokenizer, export_dir="hf_model_export")
         
-        # Option de téléversement sur Hugging Face
-        upload = input("Voulez-vous téléverser le modèle sur Hugging Face ? (yes/no): ").strip().lower()
-        if upload in ["yes", "y", "oui", "o"]:
+        upload_choice = input("Voulez-vous téléverser le modèle sur Hugging Face ? (yes/no): ").strip().lower()
+        if upload_choice in ["yes", "y", "oui", "o"]:
             repo_id = input("Entrez le nom du dépôt (format username/model-name): ").strip()
             upload_to_hf("hf_model_export", repo_id)
         else:
