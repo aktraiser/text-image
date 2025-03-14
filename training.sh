@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# Met à jour pip
+# Install required packages
 pip install --upgrade pip
-
-# Installe les dépendances nécessaires pour l'entraînement local de Wan2.1-T2V-14B
 pip install torch torchvision torchaudio
 pip install diffusers transformers accelerate peft
-pip install bitsandbytes  # Pour l'optimiseur adamw8bit
-pip install wandb  # Pour le logging avec Weights & Biases
-pip install safetensors  # Pour sauvegarder les poids efficacement
+pip install bitsandbytes
+pip install wandb
+pip install safetensors
+pip install ftfy
+pip install trl
 
-# Exécute le script Python
+# Run the training script
 python training.py
