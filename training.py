@@ -331,17 +331,176 @@ def setup_trainer(model, tokenizer, dataset):
         dataloader_pin_memory=True,
     )
     
-    # Configuration du trainer pour l'UNet
-    trainer = SFTTrainer(
-        model=model.unet,  # Entraînement de l'UNet avec LoRA
-        args=training_args,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-        data_collator=lambda examples: data_collator(examples, tokenizer)
+    return training_args
+
+def train_diffusion_model(model, tokenizer, dataset, training_args):
+    """Fonction d'entraînement personnalisée pour les modèles de diffusion avec LoRA."""
+    logger.info("Configuration de l'entraînement personnalisé pour le modèle de diffusion...")
+    
+    # Création du DataLoader
+    train_dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=training_args.per_device_train_batch_size,
+        shuffle=True,
+        collate_fn=lambda examples: data_collator(examples, tokenizer),
+        num_workers=training_args.dataloader_num_workers,
+        pin_memory=training_args.dataloader_pin_memory,
     )
     
-    logger.info("Trainer configuré pour l'UNet avec LoRA")
-    return trainer
+    # Configuration de l'optimiseur
+    from transformers import get_scheduler
+    import bitsandbytes as bnb
+    
+    # Paramètres à optimiser (uniquement les paramètres LoRA)
+    unet_params = [p for n, p in model.unet.named_parameters() if "lora" in n and p.requires_grad]
+    text_encoder_params = [p for n, p in model.text_encoder.named_parameters() if "lora" in n and p.requires_grad]
+    
+    # Utiliser l'optimiseur 8-bit AdamW pour économiser la mémoire
+    optimizer = bnb.optim.AdamW8bit(
+        unet_params + text_encoder_params,
+        lr=training_args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
+    )
+    
+    # Nombre total d'étapes d'entraînement
+    if training_args.max_steps > 0:
+        num_training_steps = training_args.max_steps
+    else:
+        num_training_steps = len(train_dataloader) * training_args.num_train_epochs // training_args.gradient_accumulation_steps
+    
+    # Planificateur de taux d'apprentissage
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=int(num_training_steps * 0.1),
+        num_training_steps=num_training_steps,
+    )
+    
+    # Préparation pour l'entraînement
+    if training_args.gradient_checkpointing:
+        model.unet.gradient_checkpointing_enable()
+        model.text_encoder.gradient_checkpointing_enable()
+    
+    # Déplacer les modèles sur GPU si disponible
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.unet.to(device)
+    model.text_encoder.to(device)
+    model.vae.to(device)
+    
+    # Mettre le VAE en mode évaluation car nous ne l'entraînons pas
+    model.vae.eval()
+    
+    # Scaler pour l'entraînement en précision mixte
+    scaler = torch.cuda.amp.GradScaler() if training_args.fp16 else None
+    
+    # Boucle d'entraînement
+    logger.info("Début de l'entraînement...")
+    global_step = 0
+    
+    # Créer les répertoires de sortie
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    os.makedirs(training_args.logging_dir, exist_ok=True)
+    
+    # Fonction de bruit pour l'entraînement du modèle de diffusion
+    from diffusers import DDPMScheduler
+    noise_scheduler = DDPMScheduler(
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        num_train_timesteps=1000,
+    )
+    
+    # Boucle principale d'entraînement
+    for epoch in range(int(training_args.num_train_epochs)):
+        model.unet.train()
+        model.text_encoder.train()
+        
+        for step, batch in enumerate(train_dataloader):
+            # Vérifier si on a atteint le nombre maximum d'étapes
+            if global_step >= training_args.max_steps:
+                break
+            
+            # Déplacer les données sur le périphérique
+            pixel_values = batch["pixel_values"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            
+            # Convertir les images en latents
+            with torch.no_grad():
+                latents = model.vae.encode(pixel_values).latent_dist.sample() * 0.18215
+            
+            # Ajouter du bruit aux latents
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            
+            # Obtenir les embeddings de texte
+            with torch.no_grad():
+                encoder_hidden_states = model.text_encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )[0]
+            
+            # Prédire le bruit
+            with torch.cuda.amp.autocast(enabled=training_args.fp16):
+                noise_pred = model.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                loss = torch.nn.functional.mse_loss(noise_pred, noise)
+            
+            # Diviser la perte par le nombre d'étapes d'accumulation de gradient
+            loss = loss / training_args.gradient_accumulation_steps
+            
+            # Rétropropagation avec précision mixte si activée
+            if training_args.fp16:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Mise à jour des poids après accumulation de gradient
+            if (step + 1) % training_args.gradient_accumulation_steps == 0:
+                if training_args.fp16:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(unet_params + text_encoder_params, 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(unet_params + text_encoder_params, 1.0)
+                    optimizer.step()
+                
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+                
+                # Logging
+                if global_step % training_args.logging_steps == 0:
+                    logger.info(f"Étape {global_step}/{num_training_steps} - Perte: {loss.item() * training_args.gradient_accumulation_steps:.4f}")
+                    if "wandb" in training_args.report_to:
+                        wandb.log({
+                            "loss": loss.item() * training_args.gradient_accumulation_steps,
+                            "lr": lr_scheduler.get_last_lr()[0],
+                            "step": global_step,
+                        })
+                
+                # Sauvegarde du modèle
+                if global_step % training_args.save_steps == 0:
+                    save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}")
+                    os.makedirs(save_path, exist_ok=True)
+                    
+                    # Sauvegarder les adaptateurs LoRA
+                    model.unet.save_pretrained(os.path.join(save_path, "unet_lora"))
+                    model.text_encoder.save_pretrained(os.path.join(save_path, "text_encoder_lora"))
+                    logger.info(f"Modèle sauvegardé à l'étape {global_step} dans {save_path}")
+    
+    # Sauvegarde finale
+    final_save_path = os.path.join(training_args.output_dir, "final")
+    os.makedirs(final_save_path, exist_ok=True)
+    model.unet.save_pretrained(os.path.join(final_save_path, "unet_lora"))
+    model.text_encoder.save_pretrained(os.path.join(final_save_path, "text_encoder_lora"))
+    logger.info(f"Entraînement terminé. Modèle final sauvegardé dans {final_save_path}")
+    
+    return model
 
 def check_disk_space(required_space_gb=10):
     """Vérifie l'espace disque disponible."""
@@ -476,7 +635,7 @@ def main():
             logger.error("Aucune donnée valide trouvée. Veuillez ajouter des images et des fichiers texte associés.")
             return
         
-        # Configuration du trainer avec les recommandations GPU
+        # Configuration de l'entraînement
         logger.info("Configuration de l'entraînement...")
         
         # Ajuster les paramètres d'entraînement en fonction des recommandations GPU
@@ -501,22 +660,6 @@ def main():
             dataloader_pin_memory=True,
         )
         
-        # Utiliser un SFTTrainer avec seulement les paramètres compatibles
-        from trl import SFTTrainer
-        
-        # Configuration du trainer compatible avec les versions plus anciennes de TRL
-        trainer = SFTTrainer(
-            model=model.unet,
-            args=training_args,
-            train_dataset=dataset,
-            data_collator=lambda examples: data_collator(examples, tokenizer)
-        )
-        
-        logger.info(f"Trainer configuré avec batch_size={training_args.per_device_train_batch_size}, "
-                   f"gradient_accumulation_steps={training_args.gradient_accumulation_steps}, "
-                   f"gradient_checkpointing={training_args.gradient_checkpointing}, "
-                   f"offload={use_offload}")
-        
         # Configuration de Weights & Biases
         wandb_entity = input("Entité Weights & Biases (laissez vide pour ignorer): ").strip()
         if wandb_entity:
@@ -524,28 +667,23 @@ def main():
                 entity=wandb_entity,
                 project="diffusion_finetune",
                 config={
-                    "learning_rate": trainer.args.learning_rate,
+                    "learning_rate": training_args.learning_rate,
                     "architecture": "Stable Diffusion 2.1 avec LoRA",
                     "dataset": dataset_path,
-                    "epochs": trainer.args.num_train_epochs,
-                    "batch_size": trainer.args.per_device_train_batch_size,
-                    "gradient_accumulation_steps": trainer.args.gradient_accumulation_steps,
+                    "epochs": training_args.num_train_epochs,
+                    "batch_size": training_args.per_device_train_batch_size,
+                    "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
                     "offload": use_offload
                 }
             )
         else:
             os.environ["WANDB_DISABLED"] = "true"
-            trainer.args.report_to = []
+            training_args.report_to = []
             logger.info("Suivi Weights & Biases désactivé.")
         
-        # Lancement de l'entraînement
+        # Lancement de l'entraînement personnalisé
         logger.info("Début de l'entraînement...")
-        trainer.train()
-        
-        # Sauvegarde du modèle
-        if trainer.args.output_dir:
-            logger.info("Sauvegarde du modèle final...")
-            trainer.save_model()
+        model = train_diffusion_model(model, tokenizer, dataset, training_args)
         
         # Exportation des adaptateurs LoRA
         logger.info("Exportation des adaptateurs LoRA...")
