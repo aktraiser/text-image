@@ -501,18 +501,15 @@ def main():
             dataloader_pin_memory=True,
         )
         
-        # Utiliser un SFTTrainer personnalisé pour éviter les problèmes avec le format du dataset
+        # Utiliser un SFTTrainer avec seulement les paramètres compatibles
         from trl import SFTTrainer
         
-        # Désactiver la conversion en format ChatML qui cause des problèmes
+        # Configuration du trainer compatible avec les versions plus anciennes de TRL
         trainer = SFTTrainer(
             model=model.unet,
             args=training_args,
             train_dataset=dataset,
-            tokenizer=tokenizer,
-            data_collator=lambda examples: data_collator(examples, tokenizer),
-            dataset_text_field=None,  # Désactive la conversion en format ChatML
-            packing=False,  # Désactive le packing qui nécessite un format spécifique
+            data_collator=lambda examples: data_collator(examples, tokenizer)
         )
         
         logger.info(f"Trainer configuré avec batch_size={training_args.per_device_train_batch_size}, "
